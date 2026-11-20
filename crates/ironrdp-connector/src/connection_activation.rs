@@ -8,8 +8,8 @@ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
-    MonotonicInstant, Sequence, State, Written, general_err, reason_err,
+    Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind,
+    ConnectorResult, DesktopSize, MonotonicInstant, Sequence, State, Written, general_err, reason_err,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -235,10 +235,9 @@ impl Sequence for ConnectionActivationSequence {
                             return Ok(Written::Nothing);
                         }
 
-                        return Err(reason_err!(
+                        return Err(ConnectorError::new(
                             "ConnectionActivation::CapabilitiesExchange",
-                            "server ended the session with error info: {}",
-                            error_info.description()
+                            ConnectorErrorKind::ServerErrorInfo(error_info),
                         ));
                     }
 

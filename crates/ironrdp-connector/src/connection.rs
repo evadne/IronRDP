@@ -1504,9 +1504,12 @@ impl Sequence for ClientConnector {
                     selected_protocol.intersects(requested_protocol)
                 };
                 if !protocol_ok {
-                    return Err(reason_err!(
+                    return Err(ConnectorError::new(
                         "Initiation",
-                        "client advertised {requested_protocol}, but server selected {selected_protocol}",
+                        ConnectorErrorKind::SelectedNotRequested {
+                            requested: requested_protocol,
+                            selected: selected_protocol,
+                        },
                     ));
                 }
 

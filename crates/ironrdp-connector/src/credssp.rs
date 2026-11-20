@@ -342,6 +342,24 @@ impl CredsspSequence {
             CredsspState::Ongoing => {
                 let message = credssp::TsRequest::from_buffer(input).map_err(|e| custom_err!("TsRequest", e))?;
                 debug!(?message, "Received");
+
+                // A refusal keeps the server's NTSTATUS as a value ([MS-CSSP] 2.2.1, 3.1.5), in the same form as
+                // `TsRequest::check_error`, whatever the authentication package would make of it.
+                if let Some(status) = message
+                    .error_code
+                    .filter(|status| *status != credssp::NStatusCode::SUCCESS)
+                {
+                    self.state = CredsspState::Failed;
+                    return Err(ConnectorError::new(
+                        "CredSSP",
+                        ConnectorErrorKind::Credssp(sspi::Error::new_with_nstatus(
+                            sspi::ErrorKind::InvalidToken,
+                            "CredSSP server returned an error status",
+                            status,
+                        )),
+                    ));
+                }
+
                 Ok(Some(message))
             }
             CredsspState::EarlyUserAuthResult => {

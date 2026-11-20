@@ -18,6 +18,7 @@ use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::{LogonErrorsInfo, ServerAutoReconnect};
 use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
@@ -1000,9 +1001,9 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
                     x224::DisconnectDescription::McsDisconnect(reason) => match reason {
                         mcs::DisconnectReason::ProviderInitiated => GracefulDisconnectReason::ServerInitiated,
                         mcs::DisconnectReason::UserRequested => GracefulDisconnectReason::UserInitiated,
-                        other => GracefulDisconnectReason::Other(other.description().to_owned()),
+                        other => GracefulDisconnectReason::McsDisconnect(other),
                     },
-                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::Other(info.description()),
+                    x224::DisconnectDescription::ErrorInfo(info) => GracefulDisconnectReason::ErrorInfo(info),
                 };
 
                 Ok(Self::Terminate(desc))
@@ -1028,11 +1029,24 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
 
 /// Reasons for graceful disconnect. This type provides GUI-friendly descriptions for
 /// disconnect reasons.
+///
+/// The server's reasons are values: what [`Self::description`] makes of them is for display and logs.
 #[derive(Debug, Clone)]
 pub enum GracefulDisconnectReason {
+    /// The disconnection was the user's: an MCS Disconnect Provider Ultimatum with the reason `rn-user-requested`,
+    /// the server's or the one the client sends when the server denies its shutdown request.
     UserInitiated,
+    /// An MCS Disconnect Provider Ultimatum with the reason `rn-provider-initiated`, an administrator's disconnection.
     ServerInitiated,
-    Other(String),
+    /// The server sent a Set Error Info PDU with this code ([MS-RDPBCGR] 2.2.5.1.1).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    ErrorInfo(ErrorInfo),
+    /// The server sent an MCS Disconnect Provider Ultimatum with another reason, which [MS-RDPBCGR] 3.1.5.1.1 does
+    /// not use.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    McsDisconnect(mcs::DisconnectReason),
 }
 
 impl GracefulDisconnectReason {
@@ -1040,7 +1054,8 @@ impl GracefulDisconnectReason {
         match self {
             GracefulDisconnectReason::UserInitiated => "user initiated disconnect".to_owned(),
             GracefulDisconnectReason::ServerInitiated => "server initiated disconnect".to_owned(),
-            GracefulDisconnectReason::Other(description) => description.clone(),
+            GracefulDisconnectReason::ErrorInfo(info) => info.description(),
+            GracefulDisconnectReason::McsDisconnect(reason) => reason.description().to_owned(),
         }
     }
 }

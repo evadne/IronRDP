@@ -69,7 +69,10 @@ impl ErrorInfo {
         }
     }
 
-    fn as_u32(self) -> u32 {
+    /// The `errorInfo` code as the server sent it ([MS-RDPBCGR] 2.2.5.1.1).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub fn as_u32(self) -> u32 {
         match self {
             Self::ProtocolIndependentCode(c) => c.as_u32(),
             Self::ProtocolIndependentLicensingCode(c) => c.as_u32(),

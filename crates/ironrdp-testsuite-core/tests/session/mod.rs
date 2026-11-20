@@ -1,6 +1,7 @@
 mod active_stage;
 mod autodetect;
 mod connection_activation;
+mod disconnect;
 mod fast_path;
 mod heartbeat;
 pub(crate) mod rfx;

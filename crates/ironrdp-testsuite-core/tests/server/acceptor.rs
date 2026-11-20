@@ -897,10 +897,16 @@ impl FramedWrite for HandshakeStream {
         if let Some(client) = self.credssp_client.as_mut()
             && buf.len() != 4
         {
-            let request = client.decode_server_message(buf).unwrap().unwrap();
-            // A request with an error code ends the exchange; the client does not answer it.
-            if request.error_code.is_none() {
-                self.incoming.push_back(client_credssp_message(client, request));
+            match client.decode_server_message(buf) {
+                Ok(request) => self
+                    .incoming
+                    .push_back(client_credssp_message(client, request.unwrap())),
+                // A request with an error code ends the exchange as soon as the client decodes it, with the
+                // server's status; the client does not answer it.
+                Err(error) => assert!(
+                    matches!(error.kind(), ConnectorErrorKind::Credssp(error) if error.nstatus.is_some()),
+                    "the client fails only on the server's status, got {error:?}"
+                ),
             }
         }
         ready(Ok(()))

@@ -8,8 +8,8 @@ use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
 use tracing::{debug, warn};
 
 use crate::{
-    ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, general_err,
-    reason_err,
+    ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, MonotonicInstant, Sequence, State,
+    Written, general_err,
 };
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -245,10 +245,9 @@ impl Sequence for ConnectionFinalizationSequence {
                                 server_error_info::ProtocolIndependentCode::None,
                             ) => ConnectionFinalizationState::WaitForResponse,
                             _ => {
-                                return Err(reason_err!(
+                                return Err(ConnectorError::new(
                                     "ServerSetErrorInfo",
-                                    "server returned error info: {}",
-                                    error_info.description()
+                                    ConnectorErrorKind::ServerErrorInfo(error_info),
                                 ));
                             }
                         }

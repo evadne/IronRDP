@@ -8,6 +8,7 @@ mod debug_redaction;
 mod display_data;
 mod early_capabilities;
 mod entra;
+mod reasons;
 #[cfg(feature = "remote-guard")]
 mod remote_guard;
 

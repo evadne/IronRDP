@@ -545,6 +545,12 @@ pub type ConnectorResult<T> = Result<T, ConnectorError>;
 pub enum ConnectorErrorKind {
     Encode(ironrdp_core::EncodeError),
     Decode(ironrdp_core::DecodeError),
+    /// A CredSSP failure.
+    ///
+    /// Where the server refused with a `TSRequest` whose `errorCode` is set ([MS-CSSP] 2.2.1), the error's
+    /// `nstatus` holds that NTSTATUS as the server sent it.
+    ///
+    /// [MS-CSSP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/
     Credssp(sspi::Error),
     EntraAuth(u32),
     Reason(String),
@@ -552,6 +558,20 @@ pub enum ConnectorErrorKind {
     General,
     Custom,
     Negotiation(NegotiationFailure),
+    /// The server selected a security protocol that the client did not request ([MS-RDPBCGR] 2.2.1.2.1).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    SelectedNotRequested {
+        /// The protocols the client requested; empty for Standard RDP Security.
+        requested: ironrdp_pdu::nego::SecurityProtocol,
+        /// The protocol the server selected; empty for Standard RDP Security.
+        selected: ironrdp_pdu::nego::SecurityProtocol,
+    },
+    /// The server ended the connection sequence with a Set Error Info PDU carrying this code
+    /// ([MS-RDPBCGR] 2.2.5.1.1).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    ServerErrorInfo(ironrdp_pdu::rdp::server_error_info::ErrorInfo),
     /// CredSSP or the Client Info PDU was about to be made, and no credentials were given.
     ///
     /// See [`Config::credentials`] and [`ClientConnector::provide_credentials`].
@@ -594,6 +614,16 @@ impl fmt::Display for ConnectorErrorKind {
             ConnectorErrorKind::General => write!(f, "general error"),
             ConnectorErrorKind::Custom => write!(f, "custom error"),
             ConnectorErrorKind::Negotiation(failure) => write!(f, "negotiation failure: {failure}"),
+            ConnectorErrorKind::SelectedNotRequested { requested, selected } => {
+                write!(f, "client advertised {requested}, but server selected {selected}")
+            }
+            ConnectorErrorKind::ServerErrorInfo(error_info) => {
+                write!(
+                    f,
+                    "server ended the session with error info: {}",
+                    error_info.description()
+                )
+            }
             ConnectorErrorKind::CredentialsNotProvided => write!(f, "credentials not provided"),
             ConnectorErrorKind::CredentialsRefused(refusal) => write!(f, "credentials refused: {refusal}"),
         }
@@ -612,6 +642,8 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::Custom => None,
             ConnectorErrorKind::General => None,
             ConnectorErrorKind::Negotiation(failure) => Some(failure),
+            ConnectorErrorKind::SelectedNotRequested { .. } => None,
+            ConnectorErrorKind::ServerErrorInfo(_) => None,
             ConnectorErrorKind::CredentialsNotProvided => None,
             ConnectorErrorKind::CredentialsRefused(_) => None,
         }
