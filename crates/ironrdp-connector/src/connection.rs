@@ -2215,6 +2215,7 @@ fn create_client_info_pdu(
         flags |= ClientInfoFlags::AUTOLOGON;
     }
 
+    #[cfg(feature = "smart-card")]
     if !entra_auth && !remote_guard && matches!(&config.credentials, crate::Credentials::SmartCard { .. }) {
         flags |= ClientInfoFlags::PASSWORD_IS_SC_PIN;
     }
