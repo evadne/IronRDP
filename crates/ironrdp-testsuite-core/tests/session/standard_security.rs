@@ -12,7 +12,7 @@ use ironrdp_pdu::rdp::headers::{
 };
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use ironrdp_pdu::rdp::standard_security::{
-    IoChannelPdu, Role, StandardSecurity, StandardSecurityError, StandardSecurityMethod,
+    IoChannelPdu, Role, StandardSecurity, StandardSecurityError, StandardSecurityLevel, StandardSecurityMethod,
 };
 use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::x224::X224;
@@ -26,7 +26,16 @@ const CLIENT_RANDOM: [u8; 32] = [0x01; 32];
 const SERVER_RANDOM: [u8; 32] = [0x02; 32];
 
 fn layer(role: Role, method: StandardSecurityMethod) -> StandardSecurity {
-    StandardSecurity::new(role, method, &CLIENT_RANDOM, &SERVER_RANDOM, IO_CHANNEL_ID, None)
+    let level = if method == StandardSecurityMethod::Fips {
+        StandardSecurityLevel::Fips
+    } else {
+        StandardSecurityLevel::High
+    };
+    layer_at(role, level, method)
+}
+
+fn layer_at(role: Role, level: StandardSecurityLevel, method: StandardSecurityMethod) -> StandardSecurity {
+    StandardSecurity::new(role, level, method, &CLIENT_RANDOM, &SERVER_RANDOM, IO_CHANNEL_ID, None)
 }
 
 fn active_stage(standard_security: StandardSecurity) -> ActiveStage {
@@ -202,4 +211,57 @@ fn a_mac_that_fails_and_an_unencrypted_frame_are_values() {
         ),
         "{error:?}"
     );
+}
+
+/// Level Low ([MS-RDPBCGR] 5.3.1, 5.3.6): the session takes the server's frames as they come, a Basic Security
+/// Header on the slow path and nothing on the fast path, and still encrypts everything it sends; an encrypted Share
+/// Data PDU or fast-path update from the server is refused, since the server sends those with a Basic Security Header
+/// alone at Low.
+// oracle: spec MS-RDPBCGR §5.3.1; spec MS-RDPBCGR §5.3.6; spec MS-RDPBCGR §2.2.9.1.1.3
+#[test]
+fn at_level_low_frames_are_taken_unencrypted_and_sent_encrypted() {
+    for method in [
+        StandardSecurityMethod::Rc440Bit,
+        StandardSecurityMethod::Rc456Bit,
+        StandardSecurityMethod::Rc4128Bit,
+    ] {
+        let server = layer_at(Role::Server, StandardSecurityLevel::Low, method);
+        let mut stage = active_stage(layer_at(Role::Client, StandardSecurityLevel::Low, method));
+        let mut image = image();
+
+        let sealed = server.seal(&POINTER_HIDDEN, IoChannelPdu::ShareControl).unwrap();
+        assert_eq!(sealed, POINTER_HIDDEN, "the server's fast path is as it is");
+        let outputs = stage.process(&mut image, Action::FastPath, &sealed, None).unwrap();
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, ActiveStageOutput::PointerHidden))
+        );
+
+        let sealed = server.seal(&set_error_info(), IoChannelPdu::ShareControl).unwrap();
+        let outputs = stage.process(&mut image, Action::X224, &sealed, None).unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [ActiveStageOutput::Terminate(_)]),
+            "{method:?}"
+        );
+
+        let event = FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1E);
+        let sent = frames(stage.process_fastpath_input(&mut image, &[event]).unwrap());
+        assert_ne!(sent[0][0] & 0x80, 0, "{method:?}: the client's fast path is encrypted");
+        let plain = encode_vec(&FastPathInput::new(vec![event]).unwrap()).unwrap();
+        assert_eq!(server.open(&sent[0]).unwrap(), plain);
+
+        // A server that encrypts its fast path at Low is refused.
+        let encrypting = layer_at(Role::Server, StandardSecurityLevel::High, method);
+        let mut stage = active_stage(layer_at(Role::Client, StandardSecurityLevel::Low, method));
+        let sealed = encrypting.seal(&POINTER_HIDDEN, IoChannelPdu::ShareControl).unwrap();
+        let error = stage.process(&mut image, Action::FastPath, &sealed, None).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                SessionErrorKind::StandardSecurity(StandardSecurityError::EncryptedAtLevelLow)
+            ),
+            "{error:?}"
+        );
+    }
 }

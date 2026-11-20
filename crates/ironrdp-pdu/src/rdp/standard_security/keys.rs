@@ -41,7 +41,7 @@ pub(super) struct Sealed {
 /// The keys of one connection, in force from the Security Exchange to its end.
 pub(super) enum SessionKeys {
     Rc4 {
-        mac_key: [u8; 16],
+        mac_key: SessionKey,
         encrypt: Box<Rc4Key>,
         decrypt: Box<Rc4Key>,
     },
@@ -74,7 +74,12 @@ impl SessionKeys {
         server_random: &[u8; SERVER_RANDOM_SIZE],
     ) -> Self {
         match method {
-            StandardSecurityMethod::Rc4128Bit => {
+            StandardSecurityMethod::Rc440Bit | StandardSecurityMethod::Rc456Bit | StandardSecurityMethod::Rc4128Bit => {
+                let strength = match method {
+                    StandardSecurityMethod::Rc440Bit => KeyStrength::Bits40,
+                    StandardSecurityMethod::Rc456Bit => KeyStrength::Bits56,
+                    _ => KeyStrength::Bits128,
+                };
                 let keys = NonFipsKeys::derive(client_random, server_random);
                 let (encrypt, decrypt) = match role {
                     Role::Client => (keys.client_encrypt_key, keys.client_decrypt_key),
@@ -82,9 +87,9 @@ impl SessionKeys {
                     Role::Server => (keys.client_decrypt_key, keys.client_encrypt_key),
                 };
                 Self::Rc4 {
-                    mac_key: keys.mac_key,
-                    encrypt: Box::new(Rc4Key::new(encrypt)),
-                    decrypt: Box::new(Rc4Key::new(decrypt)),
+                    mac_key: strength.reduce(&keys.mac_key),
+                    encrypt: Box::new(Rc4Key::new(strength, strength.reduce(&encrypt))),
+                    decrypt: Box::new(Rc4Key::new(strength, strength.reduce(&decrypt))),
                 }
             }
             StandardSecurityMethod::Fips => {
@@ -110,7 +115,7 @@ impl SessionKeys {
     pub(super) fn encrypt(&mut self, data: &[u8], count: u32) -> Sealed {
         match self {
             Self::Rc4 { mac_key, encrypt, .. } => {
-                let signature = non_fips_mac(mac_key, data, None);
+                let signature = non_fips_mac(mac_key.as_slice(), data, None);
                 let mut ciphertext = data.to_vec();
                 encrypt.apply(&mut ciphertext);
                 Sealed {
@@ -150,7 +155,7 @@ impl SessionKeys {
             Self::Rc4 { mac_key, decrypt, .. } => {
                 let mut data = ciphertext.to_vec();
                 decrypt.apply(&mut data);
-                let expected = non_fips_mac(mac_key, &data, salted.then_some(count));
+                let expected = non_fips_mac(mac_key.as_slice(), &data, salted.then_some(count));
                 (data, expected)
             }
             Self::Fips { hmac_key, decrypt, .. } => {
@@ -189,20 +194,83 @@ impl SessionKeys {
     }
 }
 
+/// The strength of an RC4 method's keys ([MS-RDPBCGR] 5.3.5.1, Table 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyStrength {
+    Bits40,
+    Bits56,
+    Bits128,
+}
+
+impl KeyStrength {
+    /// The 128-bit key reduced to this strength ([MS-RDPBCGR] 5.3.5.1): a 40-bit key is `0xD1269E` and the last 40
+    /// bits of the key's first 64, a 56-bit key `0xD1` and the last 56 of them, each an RC4 key of 8 bytes; a 128-bit
+    /// key is itself.
+    pub(super) fn reduce(self, key: &[u8; 16]) -> SessionKey {
+        match self {
+            Self::Bits128 => SessionKey::new(key),
+            Self::Bits40 | Self::Bits56 => {
+                let first_64: [u8; 8] = key[..8].try_into().expect("8 bytes");
+                self.salt(first_64)
+            }
+        }
+    }
+
+    /// Salts the first bytes of a 64-bit key to this strength's ([MS-RDPBCGR] 5.3.5.1, 5.3.7.1).
+    fn salt(self, mut key: [u8; 8]) -> SessionKey {
+        match self {
+            Self::Bits40 => key[..3].copy_from_slice(&[0xD1, 0x26, 0x9E]),
+            Self::Bits56 => key[0] = 0xD1,
+            Self::Bits128 => {}
+        }
+        SessionKey::new(&key)
+    }
+}
+
+/// An RC4 key of 8 bytes (40-bit and 56-bit) or 16 bytes (128-bit).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SessionKey {
+    bytes: [u8; 16],
+    len: usize,
+}
+
+impl SessionKey {
+    fn new(key: &[u8]) -> Self {
+        let mut bytes = [0u8; 16];
+        bytes[..key.len()].copy_from_slice(key);
+        Self { bytes, len: key.len() }
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl core::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // NOTE: the key is not shown.
+        f.debug_struct("SessionKey")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The RC4 key of one direction, renewed every [`RC4_KEY_RENEWAL_INTERVAL`] packets.
 pub(super) struct Rc4Key {
-    initial: [u8; 16],
-    current: [u8; 16],
+    strength: KeyStrength,
+    initial: SessionKey,
+    current: SessionKey,
     cipher: rc4::Rc4,
     since_renewal: u32,
 }
 
 impl Rc4Key {
-    fn new(key: [u8; 16]) -> Self {
+    fn new(strength: KeyStrength, key: SessionKey) -> Self {
         Self {
+            strength,
             initial: key,
             current: key,
-            cipher: rc4_with(&key),
+            cipher: rc4_with(key.as_slice()),
             since_renewal: 0,
         }
     }
@@ -217,34 +285,48 @@ impl Rc4Key {
         self.since_renewal += 1;
     }
 
-    /// [MS-RDPBCGR] 5.3.7.1, for a 128-bit key.
+    /// [MS-RDPBCGR] 5.3.7.1. The initial and current keys are taken whole: for the 40-bit and 56-bit methods each is
+    /// already their first 64 bits.
     fn renew(&mut self) {
         let sha = sha1::Sha1::new()
-            .chain_update(self.initial)
+            .chain_update(self.initial.as_slice())
             .chain_update(PAD1)
-            .chain_update(self.current)
+            .chain_update(self.current.as_slice())
             .finalize();
-        let mut key: [u8; 16] = md5::Md5::new()
-            .chain_update(self.initial)
+        let temp: [u8; 16] = md5::Md5::new()
+            .chain_update(self.initial.as_slice())
             .chain_update(PAD2)
             .chain_update(sha)
             .finalize()
             .into();
-        rc4_with(&key).apply_keystream(&mut key);
+
+        let key = match self.strength {
+            KeyStrength::Bits128 => {
+                let mut key = temp;
+                rc4_with(&temp).apply_keystream(&mut key);
+                SessionKey::new(&key)
+            }
+            KeyStrength::Bits40 | KeyStrength::Bits56 => {
+                let temp_64: [u8; 8] = temp[..8].try_into().expect("8 bytes");
+                let mut pre_salt = temp_64;
+                rc4_with(&temp_64).apply_keystream(&mut pre_salt);
+                self.strength.salt(pre_salt)
+            }
+        };
 
         self.current = key;
-        self.cipher = rc4_with(&key);
+        self.cipher = rc4_with(key.as_slice());
         self.since_renewal = 0;
     }
 
     #[cfg(test)]
-    pub(super) fn current(&self) -> [u8; 16] {
+    pub(super) fn current(&self) -> SessionKey {
         self.current
     }
 }
 
-fn rc4_with(key: &[u8; 16]) -> rc4::Rc4 {
-    rc4::Rc4::new_from_slice(key).expect("RC4 takes a key of 16 bytes")
+fn rc4_with(key: &[u8]) -> rc4::Rc4 {
+    rc4::Rc4::new_from_slice(key).expect("RC4 takes a key of 8 or 16 bytes")
 }
 
 /// The keys of the RC4 methods at 128 bits ([MS-RDPBCGR] 5.3.5.1).
@@ -358,7 +440,7 @@ pub(super) fn expand_fips_key(key: &[u8; 20]) -> [u8; 24] {
 }
 
 /// [MS-RDPBCGR] 5.3.6.1 and, with `count`, 5.3.6.1.1.
-pub(super) fn non_fips_mac(mac_key: &[u8; 16], data: &[u8], count: Option<u32>) -> [u8; SIGNATURE_SIZE] {
+pub(super) fn non_fips_mac(mac_key: &[u8], data: &[u8], count: Option<u32>) -> [u8; SIGNATURE_SIZE] {
     let data_length = u32::try_from(data.len()).expect("a packet's data is held to its frame's length");
     let mut sha = sha1::Sha1::new()
         .chain_update(mac_key)
@@ -416,11 +498,41 @@ mod tests {
         }
     }
 
+    /// The renewal of [MS-RDPBCGR] 5.3.7.1 for a 40-bit and a 56-bit key, written out step by step here, with the
+    /// crate's own RC4, and compared with the key's.
+    #[test]
+    fn rc4_key_renewal_of_reduced_keys_follows_the_specification() {
+        for strength in [KeyStrength::Bits40, KeyStrength::Bits56] {
+            let initial = strength.reduce(&core::array::from_fn(|index| u8::try_from(index * 3).unwrap()));
+            let mut key = Rc4Key::new(strength, initial);
+            key.renew();
+
+            let mut sha_input = Vec::new();
+            sha_input.extend_from_slice(initial.as_slice());
+            sha_input.extend_from_slice(&[0x36; 40]);
+            sha_input.extend_from_slice(initial.as_slice());
+            let sha = sha1::Sha1::digest(&sha_input);
+            let mut md5_input = Vec::new();
+            md5_input.extend_from_slice(initial.as_slice());
+            md5_input.extend_from_slice(&[0x5C; 48]);
+            md5_input.extend_from_slice(&sha);
+            let temp_128 = md5::Md5::digest(&md5_input);
+            let temp_64 = &temp_128[..8];
+            let mut expected = crate::crypto::rc4::Rc4::new(temp_64).process(temp_64);
+            match strength {
+                KeyStrength::Bits40 => expected[..3].copy_from_slice(&[0xD1, 0x26, 0x9E]),
+                _ => expected[0] = 0xD1,
+            }
+
+            assert_eq!(key.current().as_slice(), &*expected, "{strength:?}");
+        }
+    }
+
     /// The renewal of [MS-RDPBCGR] 5.3.7.1, written out step by step here and compared with the key's.
     #[test]
     fn rc4_key_renewal_follows_the_specification() {
         let initial: [u8; 16] = core::array::from_fn(|index| u8::try_from(index).unwrap());
-        let mut key = Rc4Key::new(initial);
+        let mut key = Rc4Key::new(KeyStrength::Bits128, SessionKey::new(&initial));
         key.renew();
 
         let mut sha_input = Vec::new();
@@ -435,6 +547,6 @@ mod tests {
         let temp: [u8; 16] = md5::Md5::digest(&md5_input).into();
         let new_key = crate::crypto::rc4::Rc4::new(&temp).process(&temp);
 
-        assert_eq!(key.current()[..], new_key[..]);
+        assert_eq!(key.current().as_slice(), &*new_key);
     }
 }

@@ -11,7 +11,7 @@ use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::rdp::standard_security::{
     CLIENT_RANDOM_SIZE, IoChannelPdu, Role, SERVER_RANDOM_SIZE, ServerPublicKey, StandardSecurity,
-    StandardSecurityMethod,
+    StandardSecurityLevel, StandardSecurityMethod, StandardSecuritySelection,
 };
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
@@ -44,17 +44,19 @@ enum IdentityBehind {
     StandardSecurityKey,
 }
 
-/// Why the server's Server Security Data cannot be taken under Standard RDP Security, or the method it selected.
+/// The level and the method that the server selected in its Server Security Data, or why they cannot be taken.
 ///
-/// The levels that the connector does not share are found before the method: a server at level None or Low is refused
-/// as configured so whatever it selected with it, xrdp at level Low selecting a 40-bit method that was not advertised.
+/// Level None is refused, and so is a selection that [MS-RDPBCGR] does not allow: a method that was not advertised
+/// (2.2.1.3.3), a level and a method of which one is none and the other not (5.3.2), and a level and a method that
+/// the table of 5.3.6 does not pair: High with any method but 128-bit, FIPS with any but FIPS, and the FIPS method
+/// with any level but FIPS.
 ///
 /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
-fn standard_security_method(
+fn standard_security_selection(
     security: &gcc::ServerSecurityData,
-) -> Result<StandardSecurityMethod, crate::StandardSecurityRefusal> {
+) -> Result<StandardSecuritySelection, crate::StandardSecurityRefusal> {
     use crate::StandardSecurityRefusal;
-    use gcc::{EncryptionLevel, EncryptionMethod};
+    use gcc::EncryptionLevel;
 
     let level = security.encryption_level;
     let method = security.encryption_method;
@@ -67,21 +69,27 @@ fn standard_security_method(
         (false, false) => {}
     }
 
-    if level == EncryptionLevel::Low {
-        return Err(StandardSecurityRefusal::LevelLow);
-    }
-
     // [MS-RDPBCGR] 2.2.1.3.3: the server MUST select one of the methods the client advertised.
-    let selected =
+    let selected_method =
         StandardSecurityMethod::from_selected(method).ok_or(StandardSecurityRefusal::MethodNotAdvertised { method })?;
+    let selected_level = StandardSecurityLevel::from_selected(level).ok_or_else(mismatch)?;
 
-    // [MS-RDPBCGR] 5.3.2: at level FIPS the method is FIPS; and the table of 5.3.6 has the FIPS method at no other
-    // level.
-    if (level == EncryptionLevel::Fips) != (method == EncryptionMethod::FIPS) {
+    // [MS-RDPBCGR] 5.3.6, the table of the scenarios by level and method.
+    let paired = match selected_level {
+        StandardSecurityLevel::Low | StandardSecurityLevel::ClientCompatible => {
+            selected_method != StandardSecurityMethod::Fips
+        }
+        StandardSecurityLevel::High => selected_method == StandardSecurityMethod::Rc4128Bit,
+        StandardSecurityLevel::Fips => selected_method == StandardSecurityMethod::Fips,
+    };
+    if !paired {
         return Err(mismatch());
     }
 
-    Ok(selected)
+    Ok(StandardSecuritySelection {
+        level: selected_level,
+        method: selected_method,
+    })
 }
 
 /// Maximum number of `Initiate Multitransport Request` PDUs the server is
@@ -333,7 +341,7 @@ pub enum ClientConnectorState {
         channel_connection: ChannelConnectionSequence,
         server_key: Box<ServerPublicKey>,
         server_random: [u8; SERVER_RANDOM_SIZE],
-        method: StandardSecurityMethod,
+        selection: StandardSecuritySelection,
     },
     ChannelConnection {
         io_channel_id: u16,
@@ -579,8 +587,9 @@ impl ClientConnector {
 
     /// Take Standard RDP Security only with its encryption ([MS-RDPBCGR] 5.3), where it is selected.
     ///
-    /// The Client Security Data advertises 128-bit RC4 and FIPS, and the server's selection is held to them: levels
-    /// None and Low, a method not advertised, and a level and a method that do not go together each end the connection
+    /// The Client Security Data advertises the 40-bit, 56-bit and 128-bit RC4 methods and FIPS, and the server's
+    /// selection is held to them: level None, a method not advertised, and a level and a method that do not go
+    /// together each end the connection
     /// with [`ConnectorErrorKind::StandardSecurityRefused`]. Having read the Server Security Data, the connector
     /// stops in [`ClientConnectorState::StandardSecurityKey`] with the server's key, before anything of the Security
     /// Exchange exists; the caller judges the key and answers with
@@ -605,6 +614,22 @@ impl ClientConnector {
         }
     }
 
+    /// The level and the method of Standard RDP Security that the server selected, from the moment its Server
+    /// Security Data is judged: while the connector holds the server's key, and from the caller's answer on.
+    ///
+    /// The caller may tell the person where what the server sends is not encrypted (level Low) or the keys are short
+    /// (the 40-bit and 56-bit methods).
+    pub fn standard_security_selection(&self) -> Option<StandardSecuritySelection> {
+        match (&self.state, &self.standard_security) {
+            (ClientConnectorState::StandardSecurityKey { selection, .. }, _) => Some(*selection),
+            (_, Some(security)) => Some(StandardSecuritySelection {
+                level: security.level(),
+                method: security.method(),
+            }),
+            (_, None) => None,
+        }
+    }
+
     /// Whether the connector waits for the caller's answer to the server's key under Standard RDP Security.
     pub fn should_answer_standard_security_key(&self) -> bool {
         matches!(self.state, ClientConnectorState::StandardSecurityKey { .. })
@@ -619,14 +644,15 @@ impl ClientConnector {
     ///
     /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
     pub fn accept_standard_security_key(&mut self, client_random: [u8; CLIENT_RANDOM_SIZE]) -> ConnectorResult<()> {
-        let (io_channel_id, channel_connection, server_key, server_random, method) = match mem::take(&mut self.state) {
+        let (io_channel_id, channel_connection, server_key, server_random, selection) = match mem::take(&mut self.state)
+        {
             ClientConnectorState::StandardSecurityKey {
                 io_channel_id,
                 channel_connection,
                 server_key,
                 server_random,
-                method,
-            } => (io_channel_id, channel_connection, server_key, server_random, method),
+                selection,
+            } => (io_channel_id, channel_connection, server_key, server_random, selection),
             other => {
                 self.state = other;
                 return Err(reason_err!(
@@ -641,7 +667,8 @@ impl ClientConnector {
         };
         self.standard_security = Some(StandardSecurity::new(
             Role::Client,
-            method,
+            selection.level,
+            selection.method,
             &client_random,
             &server_random,
             io_channel_id,
@@ -1862,7 +1889,7 @@ impl ClientConnector {
                 // Data, before the key is read, so that nothing of the server's identity is asked for a connection
                 // that will not be made.
                 let standard_security = if standard_security_encryption {
-                    let method = standard_security_method(&server_gcc_blocks.security).map_err(|refusal| {
+                    let selection = standard_security_selection(&server_gcc_blocks.security).map_err(|refusal| {
                         ConnectorError::new(
                             "Basic Settings Exchange",
                             ConnectorErrorKind::StandardSecurityRefused(refusal),
@@ -1876,7 +1903,7 @@ impl ClientConnector {
                         .map_err(|error| {
                             ConnectorError::new("Basic Settings Exchange", ConnectorErrorKind::ServerKey(error))
                         })?;
-                    Some((method, server_random, server_key))
+                    Some((selection, server_random, server_key))
                 } else {
                     None
                 };
@@ -1923,12 +1950,12 @@ impl ClientConnector {
                 (
                     Written::Nothing,
                     match standard_security {
-                        Some((method, server_random, server_key)) => ClientConnectorState::StandardSecurityKey {
+                        Some((selection, server_random, server_key)) => ClientConnectorState::StandardSecurityKey {
                             io_channel_id,
                             channel_connection,
                             server_key: Box::new(server_key),
                             server_random,
-                            method,
+                            selection,
                         },
                         None => ClientConnectorState::ChannelConnection {
                             io_channel_id,
@@ -2542,7 +2569,8 @@ fn create_gcc_blocks<'a>(
             },
         },
         security: ClientSecurityData {
-            // R3: 128-bit RC4 and FIPS under Standard RDP Security with its encryption; nothing otherwise.
+            // Every method the security layer implements under Standard RDP Security with its encryption; nothing
+            // otherwise.
             encryption_methods: if standard_security_encryption {
                 StandardSecurityMethod::ADVERTISED
             } else {

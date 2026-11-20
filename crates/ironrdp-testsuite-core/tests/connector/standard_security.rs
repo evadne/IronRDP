@@ -23,7 +23,9 @@ use ironrdp_pdu::rdp::headers::{ShareControlHeader, ShareControlPdu};
 use ironrdp_pdu::rdp::security_exchange::SecurityExchangePdu;
 use ironrdp_pdu::rdp::server_license::ServerCertificate;
 use ironrdp_pdu::rdp::server_license::cert::{CertificateType, ProprietaryCertificate, RsaPublicKey};
-use ironrdp_pdu::rdp::standard_security::{IoChannelPdu, Role, StandardSecurity, StandardSecurityMethod};
+use ironrdp_pdu::rdp::standard_security::{
+    IoChannelPdu, Role, StandardSecurity, StandardSecurityLevel, StandardSecurityMethod, StandardSecuritySelection,
+};
 use ironrdp_pdu::x224::{X224, X224Data};
 use ironrdp_testsuite_core::capsets::SERVER_DEMAND_ACTIVE;
 use num_bigint::BigUint;
@@ -197,15 +199,15 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-// == R3: the methods advertised == //
+// == The methods advertised == //
 
 // oracle: spec MS-RDPBCGR §2.2.1.3.3
 #[test]
-fn client_security_data_advertises_128_bit_and_fips_alone() {
+fn client_security_data_advertises_the_three_rc4_methods_and_fips() {
     let mut connector = connector(true);
     assert_eq!(
         advertised(&to_basic_settings(&mut connector)),
-        EncryptionMethod::BIT_128 | EncryptionMethod::FIPS
+        EncryptionMethod::BIT_40 | EncryptionMethod::BIT_56 | EncryptionMethod::BIT_128 | EncryptionMethod::FIPS
     );
 }
 
@@ -245,7 +247,7 @@ fn connector_without_encryption_at_basic_settings() -> ClientConnector {
     connector
 }
 
-// == R5, R3: what is refused == //
+// == What is refused == //
 
 // oracle: spec MS-RDPBCGR §5.3.1; spec MS-RDPBCGR §5.3.2
 #[test]
@@ -256,30 +258,68 @@ fn level_none_is_refused_as_its_own_kind() {
     );
 }
 
-/// Level Low is refused whatever method comes with it: xrdp at `crypt_level=low` selects 40-bit, which was not
-/// advertised, and the refusal says level Low.
-// oracle: spec MS-RDPBCGR §5.3.1; spec MS-RDPBCGR §5.3.2.1
+/// The level and the method are the caller's to read as values from the moment the Server Security Data is judged,
+/// while the key is held and after the answer: level Low, and every RC4 method at Low and Client Compatible, are
+/// taken; xrdp at `crypt_level=low` selects 40-bit.
+// oracle: spec MS-RDPBCGR §5.3.1; spec MS-RDPBCGR §5.3.6
 #[test]
-fn level_low_is_refused_as_its_own_kind() {
-    for method in [
-        EncryptionMethod::BIT_128,
-        EncryptionMethod::BIT_40,
-        EncryptionMethod::BIT_56,
+fn the_selection_is_taken_and_read_as_values() {
+    for (method, level, expected) in [
+        (
+            EncryptionMethod::BIT_40,
+            EncryptionLevel::Low,
+            (StandardSecurityLevel::Low, StandardSecurityMethod::Rc440Bit),
+        ),
+        (
+            EncryptionMethod::BIT_56,
+            EncryptionLevel::Low,
+            (StandardSecurityLevel::Low, StandardSecurityMethod::Rc456Bit),
+        ),
+        (
+            EncryptionMethod::BIT_128,
+            EncryptionLevel::Low,
+            (StandardSecurityLevel::Low, StandardSecurityMethod::Rc4128Bit),
+        ),
+        (
+            EncryptionMethod::BIT_40,
+            EncryptionLevel::ClientCompatible,
+            (
+                StandardSecurityLevel::ClientCompatible,
+                StandardSecurityMethod::Rc440Bit,
+            ),
+        ),
+        (
+            EncryptionMethod::BIT_128,
+            EncryptionLevel::High,
+            (StandardSecurityLevel::High, StandardSecurityMethod::Rc4128Bit),
+        ),
+        (
+            EncryptionMethod::FIPS,
+            EncryptionLevel::Fips,
+            (StandardSecurityLevel::Fips, StandardSecurityMethod::Fips),
+        ),
     ] {
-        assert_eq!(
-            refusal(method, EncryptionLevel::Low),
-            StandardSecurityRefusal::LevelLow,
-            "{method:?}"
-        );
+        let expected = StandardSecuritySelection {
+            level: expected.0,
+            method: expected.1,
+        };
+        let mut connector = holding_the_key(method, level);
+        assert_eq!(connector.standard_security_selection(), Some(expected));
+        connector.accept_standard_security_key(CLIENT_RANDOM).unwrap();
+        assert_eq!(connector.standard_security_selection(), Some(expected));
     }
+
+    let mut connector = connector(true);
+    assert_eq!(connector.standard_security_selection(), None);
+    to_basic_settings(&mut connector);
+    assert_eq!(connector.standard_security_selection(), None);
 }
 
 // oracle: spec MS-RDPBCGR §2.2.1.3.3
 #[test]
 fn a_method_not_advertised_is_refused() {
     for method in [
-        EncryptionMethod::BIT_40,
-        EncryptionMethod::BIT_56,
+        EncryptionMethod::BIT_40 | EncryptionMethod::BIT_56,
         EncryptionMethod::BIT_128 | EncryptionMethod::FIPS,
     ] {
         assert_eq!(
@@ -299,6 +339,12 @@ fn a_level_and_a_method_that_do_not_go_together_are_refused() {
         (EncryptionMethod::BIT_128, EncryptionLevel::Fips),
         (EncryptionMethod::FIPS, EncryptionLevel::High),
         (EncryptionMethod::FIPS, EncryptionLevel::ClientCompatible),
+        (EncryptionMethod::FIPS, EncryptionLevel::Low),
+        // High is the server's strongest method, which the table of 5.3.6 has as 128-bit alone: a weaker one at
+        // High is refused, so advertising the weaker methods cannot weaken a host at High.
+        (EncryptionMethod::BIT_40, EncryptionLevel::High),
+        (EncryptionMethod::BIT_56, EncryptionLevel::High),
+        (EncryptionMethod::BIT_40, EncryptionLevel::Fips),
     ] {
         assert_eq!(
             refusal(method, level),
@@ -379,7 +425,8 @@ fn the_server_key_is_held_for_the_caller_and_nothing_is_sent_until_it_is_answere
 /// The whole connection under 128-bit RC4 and FIPS: the Security Exchange carries the caller's client random,
 /// encrypted with the server's key; the Client Info is encrypted, with the name and the password given after the
 /// answer and in no byte before it; the licensing PDU is taken unencrypted; and the Demand Active, encrypted by the
-/// server, is answered with a Confirm Active encrypted by the client.
+/// server above level Low and with a Basic Security Header alone at Low, is answered with a Confirm Active encrypted by
+/// the client.
 // oracle: spec MS-RDPBCGR §2.2.1.10; spec MS-RDPBCGR §2.2.1.11; spec MS-RDPBCGR §5.3.4.1; spec MS-RDPBCGR §5.3.8
 #[test]
 fn every_pdu_after_the_security_exchange_is_encrypted() {
@@ -387,12 +434,16 @@ fn every_pdu_after_the_security_exchange_is_encrypted() {
         (EncryptionMethod::BIT_128, EncryptionLevel::High),
         (EncryptionMethod::BIT_128, EncryptionLevel::ClientCompatible),
         (EncryptionMethod::FIPS, EncryptionLevel::Fips),
+        (EncryptionMethod::BIT_40, EncryptionLevel::Low),
+        (EncryptionMethod::BIT_56, EncryptionLevel::ClientCompatible),
+        (EncryptionMethod::BIT_128, EncryptionLevel::Low),
     ] {
         let mut connector = holding_the_key(method, level);
         connector.accept_standard_security_key(CLIENT_RANDOM).unwrap();
         connector.provide_credentials(password(), None).unwrap();
         let server = StandardSecurity::new(
             Role::Server,
+            StandardSecurityLevel::from_selected(level).unwrap(),
             StandardSecurityMethod::from_selected(method).unwrap(),
             &CLIENT_RANDOM,
             &SERVER_RANDOM,
@@ -511,6 +562,7 @@ fn an_unencrypted_pdu_or_a_mac_that_fails_ends_the_connection_with_a_value() {
         connector.provide_credentials(password(), None).unwrap();
         let server = StandardSecurity::new(
             Role::Server,
+            StandardSecurityLevel::High,
             StandardSecurityMethod::Rc4128Bit,
             &CLIENT_RANDOM,
             &SERVER_RANDOM,
@@ -581,8 +633,14 @@ fn xrdp_frames_open_under_keys_derived_from_the_two_randoms() {
         ),
     ] {
         let random = |hex: &str| -> [u8; 32] { hex::decode(hex).unwrap().try_into().unwrap() };
+        let level = if method == StandardSecurityMethod::Fips {
+            StandardSecurityLevel::Fips
+        } else {
+            StandardSecurityLevel::High
+        };
         let client = StandardSecurity::new(
             Role::Client,
+            level,
             method,
             &random(client_random),
             &random(server_random),

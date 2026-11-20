@@ -1,9 +1,8 @@
 //! Tests of the security layer, against [MS-RDPBCGR] section 4 where it gives bytes, and against a peer of the other
 //! role built from the same randoms everywhere else.
 
-use super::keys::{self, NonFipsKeys};
+use super::keys::{self, KeyStrength, NonFipsKeys};
 use super::*;
-use crate::gcc::EncryptionLevel;
 use crate::mcs::ConnectResponse;
 use crate::rdp::security_exchange::SecurityExchangePdu;
 use crate::rdp::server_license::ServerCertificate;
@@ -124,10 +123,21 @@ const MESSAGE_CHANNEL: u16 = 1008;
 const STATIC_CHANNEL: u16 = 1004;
 const USER_CHANNEL: u16 = 1007;
 
+/// A client and a server at level High, or FIPS for the FIPS method.
 fn pair(method: StandardSecurityMethod) -> (StandardSecurity, StandardSecurity) {
+    let level = if method == StandardSecurityMethod::Fips {
+        StandardSecurityLevel::Fips
+    } else {
+        StandardSecurityLevel::High
+    };
+    pair_at(level, method)
+}
+
+fn pair_at(level: StandardSecurityLevel, method: StandardSecurityMethod) -> (StandardSecurity, StandardSecurity) {
     let make = |role| {
         StandardSecurity::new(
             role,
+            level,
             method,
             &CLIENT_RANDOM,
             &SERVER_RANDOM,
@@ -310,8 +320,18 @@ fn section_4_1_10_client_info_is_sealed_with_the_section_layout() {
 
 #[test]
 fn every_kind_of_slow_path_pdu_round_trips_under_both_methods() {
-    for method in [StandardSecurityMethod::Rc4128Bit, StandardSecurityMethod::Fips] {
-        let (client, server) = pair(method);
+    for method in [
+        StandardSecurityMethod::Rc440Bit,
+        StandardSecurityMethod::Rc456Bit,
+        StandardSecurityMethod::Rc4128Bit,
+        StandardSecurityMethod::Fips,
+    ] {
+        let (client, server) = pair_at(StandardSecurityLevel::ClientCompatible, method);
+        let (client, server) = if method == StandardSecurityMethod::Fips {
+            pair(method)
+        } else {
+            (client, server)
+        };
 
         // Share Control on the I/O channel, a static channel, the message channel, and the Client Info.
         let cases: [(u16, Vec<u8>, IoChannelPdu); 4] = [
@@ -491,11 +511,23 @@ fn a_salted_mac_is_checked_with_the_count() {
 
 /// [MS-RDPBCGR] 5.3.7.1: the keys of each direction are renewed after 4,096 packets, so that the 4,096th packet is
 /// the last under the initial key and the 4,097th the first under the new one; the peer, renewing its own keys, keeps
-/// decrypting.
+/// decrypting. At 40, 56 and 128 bits.
 #[test]
 fn rc4_keys_are_renewed_after_the_4096th_packet_each_way() {
-    let (client, server) = pair(StandardSecurityMethod::Rc4128Bit);
-    let initial = NonFipsKeys::derive(&CLIENT_RANDOM, &SERVER_RANDOM);
+    for (method, strength) in [
+        (StandardSecurityMethod::Rc440Bit, KeyStrength::Bits40),
+        (StandardSecurityMethod::Rc456Bit, KeyStrength::Bits56),
+        (StandardSecurityMethod::Rc4128Bit, KeyStrength::Bits128),
+    ] {
+        rc4_keys_are_renewed_after_the_4096th_packet(method, strength);
+    }
+}
+
+fn rc4_keys_are_renewed_after_the_4096th_packet(method: StandardSecurityMethod, strength: KeyStrength) {
+    let (client, server) = pair_at(StandardSecurityLevel::ClientCompatible, method);
+    let keys = NonFipsKeys::derive(&CLIENT_RANDOM, &SERVER_RANDOM);
+    let initial_encrypt = strength.reduce(&keys.client_encrypt_key);
+    let initial_decrypt = strength.reduce(&keys.client_decrypt_key);
 
     let current = |security: &StandardSecurity| {
         let layer = security.lock().unwrap();
@@ -523,11 +555,11 @@ fn rc4_keys_are_renewed_after_the_4096th_packet_each_way() {
 
         let (client_encrypt, client_decrypt) = current(&client);
         if packet <= RC4_KEY_RENEWAL_INTERVAL {
-            assert_eq!(client_encrypt, initial.client_encrypt_key, "packet {packet}");
-            assert_eq!(client_decrypt, initial.client_decrypt_key, "packet {packet}");
+            assert_eq!(client_encrypt, initial_encrypt, "{method:?} packet {packet}");
+            assert_eq!(client_decrypt, initial_decrypt, "{method:?} packet {packet}");
         } else {
-            assert_ne!(client_encrypt, initial.client_encrypt_key, "packet {packet}");
-            assert_ne!(client_decrypt, initial.client_decrypt_key, "packet {packet}");
+            assert_ne!(client_encrypt, initial_encrypt, "{method:?} packet {packet}");
+            assert_ne!(client_decrypt, initial_decrypt, "{method:?} packet {packet}");
             // The server's keys are the client's, the other way round.
             assert_eq!(current(&server), (client_decrypt, client_encrypt));
         }
@@ -784,4 +816,177 @@ fn debug_shows_no_key() {
     let shown = format!("{client:?}");
     assert!(!shown.contains("11, 17"), "{shown}");
     assert!(shown.contains("Rc4128Bit"));
+}
+
+// == The 40-bit and 56-bit methods == //
+
+/// [MS-RDPBCGR] 5.3.5.1, Table 1 and the formulas after it: a 40-bit key is 0xD1269E and the last 40 bits of the
+/// 128-bit key's first 64, a 56-bit key 0xD1 and the last 56 of them. The section gives the salts and the formulas and
+/// no example key, so this holds the formula, not a published vector.
+#[test]
+fn keys_are_reduced_to_40_and_56_bits_with_the_salt_of_table_1() {
+    let key: [u8; 16] = core::array::from_fn(|index| u8::try_from(0x10 + index).unwrap());
+    assert_eq!(
+        KeyStrength::Bits40.reduce(&key).as_slice(),
+        [0xD1, 0x26, 0x9E, 0x13, 0x14, 0x15, 0x16, 0x17]
+    );
+    assert_eq!(
+        KeyStrength::Bits56.reduce(&key).as_slice(),
+        [0xD1, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+    );
+    assert_eq!(KeyStrength::Bits128.reduce(&key).as_slice(), key);
+}
+
+/// [MS-RDPBCGR] 5.3.6.1: the MAC key is reduced as the encryption keys are, and the MAC is made with the reduced key.
+#[test]
+fn the_mac_of_a_40_bit_packet_is_made_with_the_reduced_mac_key() {
+    let (_, server) = pair_at(
+        StandardSecurityLevel::ClientCompatible,
+        StandardSecurityMethod::Rc440Bit,
+    );
+    let keys = NonFipsKeys::derive(&CLIENT_RANDOM, &SERVER_RANDOM);
+    let mac_key = KeyStrength::Bits40.reduce(&keys.mac_key);
+
+    let sealed = server
+        .seal(&indication(IO_CHANNEL, b"forty"), IoChannelPdu::ShareControl)
+        .unwrap();
+    let user_data = user_data_of(&sealed);
+    assert_eq!(user_data[4..12], keys::non_fips_mac(mac_key.as_slice(), b"forty", None));
+
+    let mut ciphertext = user_data[12..].to_vec();
+    rc4::StreamCipher::apply_keystream(
+        &mut <rc4::Rc4 as rc4::KeyInit>::new_from_slice(
+            KeyStrength::Bits40.reduce(&keys.client_decrypt_key).as_slice(),
+        )
+        .unwrap(),
+        &mut ciphertext,
+    );
+    assert_eq!(
+        ciphertext, b"forty",
+        "the server encrypts with the client's decryption key, reduced"
+    );
+}
+
+#[test]
+fn only_exactly_one_advertised_method_is_taken() {
+    assert_eq!(
+        StandardSecurityMethod::ADVERTISED,
+        EncryptionMethod::BIT_40 | EncryptionMethod::BIT_56 | EncryptionMethod::BIT_128 | EncryptionMethod::FIPS
+    );
+    for method in [
+        StandardSecurityMethod::Rc440Bit,
+        StandardSecurityMethod::Rc456Bit,
+        StandardSecurityMethod::Rc4128Bit,
+        StandardSecurityMethod::Fips,
+    ] {
+        assert_eq!(
+            StandardSecurityMethod::from_selected(method.encryption_method()),
+            Some(method)
+        );
+    }
+    assert_eq!(
+        StandardSecurityMethod::from_selected(EncryptionMethod::BIT_40 | EncryptionMethod::BIT_128),
+        None
+    );
+    assert_eq!(StandardSecurityMethod::from_selected(EncryptionMethod::empty()), None);
+}
+
+// == Level Low == //
+
+/// [MS-RDPBCGR] 5.3.1, 5.3.6 and the securityHeader of every server PDU of 2.2: at level Low what the client sends is
+/// encrypted, and what the server sends carries a Basic Security Header without `SEC_ENCRYPT`, and no MAC, on the slow
+/// path, and no encryption flag or signature on the fast path (2.2.9.1.2).
+#[test]
+fn at_level_low_the_client_encrypts_and_the_server_does_not() {
+    for method in [
+        StandardSecurityMethod::Rc440Bit,
+        StandardSecurityMethod::Rc456Bit,
+        StandardSecurityMethod::Rc4128Bit,
+    ] {
+        let (client, server) = pair_at(StandardSecurityLevel::Low, method);
+
+        // Client to server: encrypted, the Client Info among it.
+        let client_info = [&[0x40, 0x00, 0x00, 0x00][..], b"client info"].concat();
+        let sealed = client
+            .seal(&request(IO_CHANNEL, &client_info), IoChannelPdu::ClientInfo)
+            .unwrap();
+        assert_eq!(user_data_of(&sealed)[..2], [0x48, 0x00], "{method:?}");
+        assert_eq!(user_data_of(&server.open(&sealed).unwrap()), client_info);
+
+        // Server to client, slow path: a Basic Security Header, the data in the clear.
+        let sealed = server
+            .seal(&indication(IO_CHANNEL, b"share control"), IoChannelPdu::ShareControl)
+            .unwrap();
+        assert_eq!(
+            user_data_of(&sealed),
+            [&[0x00, 0x00, 0x00, 0x00][..], b"share control"].concat()
+        );
+        assert_eq!(user_data_of(&client.open(&sealed).unwrap()), b"share control");
+
+        // On the message channel, the header keeps its flags.
+        let autodetect = [&[0x00, 0x10, 0x00, 0x00][..], b"autodetect"].concat();
+        let sealed = server
+            .seal(&indication(MESSAGE_CHANNEL, &autodetect), IoChannelPdu::ShareControl)
+            .unwrap();
+        assert_eq!(user_data_of(&sealed), autodetect);
+        assert_eq!(user_data_of(&client.open(&sealed).unwrap()), autodetect);
+
+        // Fast path: as it is.
+        let frame = fast_path(0, &[0x05, 0x00, 0x00]);
+        assert_eq!(server.seal(&frame, IoChannelPdu::ShareControl).unwrap(), frame);
+        assert_eq!(client.open(&frame).unwrap(), frame);
+    }
+}
+
+/// An unencrypted PDU from the server is refused above level Low and taken at it.
+#[test]
+fn an_unencrypted_pdu_is_refused_at_high_and_taken_at_low() {
+    let frame = indication(IO_CHANNEL, &[0x00, 0x00, 0x00, 0x00, 0x01, 0x02]);
+    for (level, taken) in [
+        (StandardSecurityLevel::Low, true),
+        (StandardSecurityLevel::ClientCompatible, false),
+        (StandardSecurityLevel::High, false),
+    ] {
+        let (client, _) = pair_at(level, StandardSecurityMethod::Rc4128Bit);
+        let result = client.open(&frame);
+        if taken {
+            assert_eq!(user_data_of(&result.unwrap()), [0x01, 0x02]);
+        } else {
+            assert!(matches!(result, Err(StandardSecurityError::Unencrypted)), "{level:?}");
+        }
+    }
+}
+
+/// At level Low the server may encrypt only the PDUs whose security header is a Basic Security Header at Low only
+/// without `SEC_ENCRYPT`: licensing (2.2.1.12), auto-detection (2.2.14.3), multitransport (2.2.15.1) and the
+/// heartbeat (2.2.16.1). Those are opened with their MAC verified; any other encrypted PDU, slow path or fast path,
+/// is refused.
+#[test]
+fn at_level_low_an_encrypted_pdu_is_taken_only_where_the_specification_allows_it() {
+    let (low_client, _) = pair_at(StandardSecurityLevel::Low, StandardSecurityMethod::Rc4128Bit);
+    // A server of the same keys that encrypts, as a server encrypting what it may at Low does.
+    let (_, encrypting_server) = pair_at(StandardSecurityLevel::High, StandardSecurityMethod::Rc4128Bit);
+
+    let autodetect = [&[0x00, 0x10, 0x00, 0x00][..], b"autodetect"].concat();
+    let sealed = encrypting_server
+        .seal(&indication(MESSAGE_CHANNEL, &autodetect), IoChannelPdu::ShareControl)
+        .unwrap();
+    assert_eq!(user_data_of(&sealed)[..2], [0x08, 0x10]);
+    assert_eq!(user_data_of(&low_client.open(&sealed).unwrap()), autodetect);
+
+    let sealed = encrypting_server
+        .seal(&indication(IO_CHANNEL, b"share control"), IoChannelPdu::ShareControl)
+        .unwrap();
+    assert!(matches!(
+        low_client.open(&sealed),
+        Err(StandardSecurityError::EncryptedAtLevelLow)
+    ));
+
+    let sealed = encrypting_server
+        .seal(&fast_path(0, &[0x05, 0x00, 0x00]), IoChannelPdu::ShareControl)
+        .unwrap();
+    assert!(matches!(
+        low_client.open(&sealed),
+        Err(StandardSecurityError::EncryptedAtLevelLow)
+    ));
 }

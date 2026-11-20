@@ -43,7 +43,8 @@ pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
 pub use self::server_name::ServerName;
 pub use crate::license_exchange::LicenseCache;
 pub use ironrdp_pdu::rdp::standard_security::{
-    IoChannelPdu, ServerKeyError, ServerPublicKey, StandardSecurity, StandardSecurityError,
+    IoChannelPdu, ServerKeyError, ServerPublicKey, StandardSecurity, StandardSecurityError, StandardSecurityLevel,
+    StandardSecurityMethod, StandardSecuritySelection,
 };
 
 /// Provides user-friendly error messages for RDP negotiation failures
@@ -593,9 +594,9 @@ pub enum ConnectorErrorKind {
 
 /// Why the connector refuses the server's selection of encryption under Standard RDP Security.
 ///
-/// Levels None and Low are each a configuration that [MS-RDPBCGR] allows a server and that the connector does not
-/// share with it: under either, what the server sends would cross the network unencrypted. The other two are the
-/// server's breach of [MS-RDPBCGR] 2.2.1.3.3 and 5.3.2.
+/// Level None is a configuration that [MS-RDPBCGR] allows a server and that the connector does not share with it:
+/// nothing would be encrypted, the credential included, and the server would present no key. The other two are the
+/// server's breach of [MS-RDPBCGR] 2.2.1.3.3, 5.3.2 and 5.3.6.
 ///
 /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
 #[non_exhaustive]
@@ -603,12 +604,10 @@ pub enum ConnectorErrorKind {
 pub enum StandardSecurityRefusal {
     /// `ENCRYPTION_LEVEL_NONE` with `ENCRYPTION_METHOD_NONE`: nothing is encrypted.
     LevelNone,
-    /// `ENCRYPTION_LEVEL_LOW`: only what the client sends is encrypted.
-    LevelLow,
     /// A method that is not exactly one of those the client advertised.
     MethodNotAdvertised { method: gcc::EncryptionMethod },
-    /// A level and a method that [MS-RDPBCGR] 5.3.2 does not allow together: one of them none and the other not, or
-    /// one of them FIPS and the other not.
+    /// A level and a method that [MS-RDPBCGR] does not allow together: one of them none and the other not (5.3.2),
+    /// or a pair that the table of 5.3.6 does not have: High with a method but 128-bit, and FIPS with any but FIPS.
     ///
     /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
     LevelMethodMismatch {
@@ -621,7 +620,6 @@ impl fmt::Display for StandardSecurityRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LevelNone => write!(f, "the server selected encryption level None"),
-            Self::LevelLow => write!(f, "the server selected encryption level Low"),
             Self::MethodNotAdvertised { method } => {
                 write!(
                     f,

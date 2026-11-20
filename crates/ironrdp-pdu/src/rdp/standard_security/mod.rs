@@ -5,8 +5,8 @@
 //! slow path's security header ([MS-RDPBCGR] 2.2.8.1.1.2, 2.2.9.1.1.2) and the fast path's encryption flags,
 //! FIPS information and signature ([MS-RDPBCGR] 2.2.8.1.2, 2.2.9.1.2), around data encrypted under the session keys.
 //!
-//! Only the methods that a client of this crate advertises are implemented: 128-bit RC4 and FIPS
-//! ([`StandardSecurityMethod`]).
+//! The methods are RC4 at 40, 56 and 128 bits, and FIPS ([`StandardSecurityMethod`]); the levels Low, Client
+//! Compatible, High and FIPS ([`StandardSecurityLevel`]), of which Low leaves what the server sends unencrypted.
 //!
 //! [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
 
@@ -21,7 +21,7 @@ use ironrdp_core::{DecodeError, EncodeError, decode, encode_vec};
 
 use self::keys::{FIPS_BLOCK_SIZE, PacketCount, SIGNATURE_SIZE, SessionKeys};
 pub use self::server_key::{MAX_MODULUS_BITS, MIN_MODULUS_BITS, ServerKeyError, ServerPublicKey};
-use crate::gcc::EncryptionMethod;
+use crate::gcc::{EncryptionLevel, EncryptionMethod};
 use crate::mcs::{McsMessage, SendDataIndication, SendDataRequest};
 use crate::rdp::client_info::ClientAutoReconnect;
 use crate::rdp::headers::BasicSecurityHeaderFlags;
@@ -73,6 +73,10 @@ const ENCRYPTION_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::ENC
 /// An encryption method of Standard RDP Security that this crate implements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandardSecurityMethod {
+    /// `ENCRYPTION_METHOD_40BIT`: RC4 with 40-bit keys, MACs of MD5 and SHA-1.
+    Rc440Bit,
+    /// `ENCRYPTION_METHOD_56BIT`: RC4 with 56-bit keys, MACs of MD5 and SHA-1.
+    Rc456Bit,
     /// `ENCRYPTION_METHOD_128BIT`: RC4 with 128-bit keys, MACs of MD5 and SHA-1.
     Rc4128Bit,
     /// `ENCRYPTION_METHOD_FIPS`: Triple DES in CBC mode, MACs of HMAC-SHA-1.
@@ -81,25 +85,78 @@ pub enum StandardSecurityMethod {
 
 impl StandardSecurityMethod {
     /// The methods a client advertises in its Client Security Data: every method this crate implements.
-    pub const ADVERTISED: EncryptionMethod = EncryptionMethod::BIT_128.union(EncryptionMethod::FIPS);
+    pub const ADVERTISED: EncryptionMethod = EncryptionMethod::BIT_40
+        .union(EncryptionMethod::BIT_56)
+        .union(EncryptionMethod::BIT_128)
+        .union(EncryptionMethod::FIPS);
 
     /// The method the server selected in its Server Security Data, if it is exactly one that this crate implements.
     pub fn from_selected(method: EncryptionMethod) -> Option<Self> {
-        if method == EncryptionMethod::BIT_128 {
-            Some(Self::Rc4128Bit)
-        } else if method == EncryptionMethod::FIPS {
-            Some(Self::Fips)
-        } else {
-            None
-        }
+        [Self::Rc440Bit, Self::Rc456Bit, Self::Rc4128Bit, Self::Fips]
+            .into_iter()
+            .find(|candidate| candidate.encryption_method() == method)
     }
 
     pub fn encryption_method(self) -> EncryptionMethod {
         match self {
+            Self::Rc440Bit => EncryptionMethod::BIT_40,
+            Self::Rc456Bit => EncryptionMethod::BIT_56,
             Self::Rc4128Bit => EncryptionMethod::BIT_128,
             Self::Fips => EncryptionMethod::FIPS,
         }
     }
+}
+
+/// An encryption level of Standard RDP Security above None, as the server selected it ([MS-RDPBCGR] 5.3.1).
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardSecurityLevel {
+    /// `ENCRYPTION_LEVEL_LOW`: only what the client sends is encrypted. What the server sends carries a Basic
+    /// Security Header and no MAC, and is not encrypted.
+    Low,
+    /// `ENCRYPTION_LEVEL_CLIENT_COMPATIBLE`.
+    ClientCompatible,
+    /// `ENCRYPTION_LEVEL_HIGH`.
+    High,
+    /// `ENCRYPTION_LEVEL_FIPS`.
+    Fips,
+}
+
+impl StandardSecurityLevel {
+    /// The level the server selected in its Server Security Data, if it is above None.
+    pub fn from_selected(level: EncryptionLevel) -> Option<Self> {
+        match level {
+            EncryptionLevel::None => None,
+            EncryptionLevel::Low => Some(Self::Low),
+            EncryptionLevel::ClientCompatible => Some(Self::ClientCompatible),
+            EncryptionLevel::High => Some(Self::High),
+            EncryptionLevel::Fips => Some(Self::Fips),
+        }
+    }
+
+    pub fn encryption_level(self) -> EncryptionLevel {
+        match self {
+            Self::Low => EncryptionLevel::Low,
+            Self::ClientCompatible => EncryptionLevel::ClientCompatible,
+            Self::High => EncryptionLevel::High,
+            Self::Fips => EncryptionLevel::Fips,
+        }
+    }
+
+    /// Whether what the server sends is encrypted at this level ([MS-RDPBCGR] 5.3.6).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub fn server_encrypts(self) -> bool {
+        self != Self::Low
+    }
+}
+
+/// The level and the method of Standard RDP Security that the server selected and the client takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StandardSecuritySelection {
+    pub level: StandardSecurityLevel,
+    pub method: StandardSecurityMethod,
 }
 
 /// Which end of the connection a [`StandardSecurity`] is.
@@ -144,6 +201,8 @@ pub enum StandardSecurityError {
     MacMismatch,
     /// A received packet is not encrypted, though encryption is in force and its encryption is not optional.
     Unencrypted,
+    /// At level Low, a received packet is encrypted that the server sends with a Basic Security Header alone.
+    EncryptedAtLevelLow,
     /// A received frame's lengths or fields do not hold together: what is named.
     Malformed(&'static str),
     /// A frame to be sent would be longer than its framing can say once sealed.
@@ -161,6 +220,7 @@ impl fmt::Display for StandardSecurityError {
         match self {
             Self::MacMismatch => write!(f, "the MAC of a received packet does not verify"),
             Self::Unencrypted => write!(f, "a received packet is not encrypted though encryption is in force"),
+            Self::EncryptedAtLevelLow => write!(f, "a received packet is encrypted though the level is Low"),
             Self::Malformed(what) => write!(f, "a received frame is malformed: {what}"),
             Self::TooLong { length } => write!(f, "a frame of {length} bytes is too long to be sealed"),
             Self::Decode(error) => write!(f, "a frame cannot be read: {error}"),
@@ -189,6 +249,7 @@ impl core::error::Error for StandardSecurityError {
 pub struct StandardSecurity {
     layer: Arc<Mutex<Layer>>,
     role: Role,
+    level: StandardSecurityLevel,
     method: StandardSecurityMethod,
     io_channel_id: u16,
     message_channel_id: Option<u16>,
@@ -199,6 +260,7 @@ impl fmt::Debug for StandardSecurity {
         // NOTE: no key, random or count is shown.
         f.debug_struct("StandardSecurity")
             .field("role", &self.role)
+            .field("level", &self.level)
             .field("method", &self.method)
             .field("io_channel_id", &self.io_channel_id)
             .field("message_channel_id", &self.message_channel_id)
@@ -219,6 +281,7 @@ impl StandardSecurity {
     /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
     pub fn new(
         role: Role,
+        level: StandardSecurityLevel,
         method: StandardSecurityMethod,
         client_random: &[u8; CLIENT_RANDOM_SIZE],
         server_random: &[u8; SERVER_RANDOM_SIZE],
@@ -233,6 +296,7 @@ impl StandardSecurity {
                 client_random: *client_random,
             })),
             role,
+            level,
             method,
             io_channel_id,
             message_channel_id,
@@ -241,6 +305,20 @@ impl StandardSecurity {
 
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    pub fn level(&self) -> StandardSecurityLevel {
+        self.level
+    }
+
+    /// Whether what this end sends is encrypted: the client's always is, the server's above level Low.
+    fn sends_encrypted(&self) -> bool {
+        self.role == Role::Client || self.level.server_encrypts()
+    }
+
+    /// Whether what this end receives is encrypted: the server's always is, the client's above level Low.
+    fn receives_encrypted(&self) -> bool {
+        self.role == Role::Server || self.level.server_encrypts()
     }
 
     pub fn method(&self) -> StandardSecurityMethod {
@@ -392,6 +470,15 @@ impl StandardSecurity {
             (BasicSecurityHeaderFlags::empty(), user_data)
         };
 
+        if !self.sends_encrypted() {
+            // The server at level Low: a Basic Security Header and the data as it is.
+            let mut out = Vec::with_capacity(4 + data.len());
+            out.extend_from_slice(&flags.bits().to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // flagsHi
+            out.extend_from_slice(data);
+            return Ok(out);
+        }
+
         let mut layer = self.lock()?;
         let layer = &mut *layer;
         let count = layer.encrypt_count.next_value();
@@ -416,13 +503,25 @@ impl StandardSecurity {
         ))?;
         let flags = BasicSecurityHeaderFlags::from_bits_retain(u16::from_le_bytes([header[0], header[1]]));
 
-        if !flags.contains(BasicSecurityHeaderFlags::ENCRYPT) {
+        let encrypted = flags.contains(BasicSecurityHeaderFlags::ENCRYPT);
+
+        if !encrypted {
+            if !self.receives_encrypted() {
+                // Level Low: the server's PDUs carry a Basic Security Header and no MAC ([MS-RDPBCGR] 5.3.6, and the
+                // securityHeader of each server PDU of 2.2: "Basic Security Header ... if the Encryption Level
+                // selected by the server is ENCRYPTION_LEVEL_LOW").
+                return Ok(with_carried_flags(flags, rest));
+            }
             // [MS-RDPBCGR] 5.3.6: licensing PDUs have optional encryption; every other PDU is encrypted.
             return if flags.contains(BasicSecurityHeaderFlags::LICENSE_PKT) {
                 Ok(user_data.to_vec())
             } else {
                 Err(StandardSecurityError::Unencrypted)
             };
+        }
+
+        if !self.receives_encrypted() && !flags.intersects(MAY_BE_ENCRYPTED_AT_LOW) {
+            return Err(StandardSecurityError::EncryptedAtLevelLow);
         }
 
         let (padding, rest) = self.read_fips_information(rest)?;
@@ -441,16 +540,7 @@ impl StandardSecurity {
             )?
         };
 
-        let carried = flags.difference(ENCRYPTION_FLAGS);
-        if carried.is_empty() {
-            Ok(data)
-        } else {
-            let mut out = Vec::with_capacity(4 + data.len());
-            out.extend_from_slice(&carried.bits().to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&data);
-            Ok(out)
-        }
+        Ok(with_carried_flags(flags, &data))
     }
 
     /// Reads the FIPS fields that follow the flags under FIPS, the same in the slow path's FIPS security header and
@@ -475,6 +565,12 @@ impl StandardSecurity {
 
     fn seal_fast_path(&self, frame: &[u8], sealed: &mut Vec<u8>) -> Result<(), StandardSecurityError> {
         let (header, payload) = split_fast_path(frame)?;
+
+        if !self.sends_encrypted() {
+            // The server at level Low: no encryption flags and no signature.
+            sealed.extend_from_slice(frame);
+            return Ok(());
+        }
 
         let mut layer = self.lock()?;
         let layer = &mut *layer;
@@ -503,8 +599,13 @@ impl StandardSecurity {
 
     fn open_fast_path(&self, frame: &[u8]) -> Result<Vec<u8>, StandardSecurityError> {
         let (header, body) = split_fast_path(frame)?;
-        if header & FAST_PATH_ENCRYPTED == 0 {
-            return Err(StandardSecurityError::Unencrypted);
+        match (header & FAST_PATH_ENCRYPTED != 0, self.receives_encrypted()) {
+            (true, true) => {}
+            // Level Low: the server's fast-path PDUs carry no signature, which is present only where the
+            // encryption flag is set ([MS-RDPBCGR] 2.2.9.1.2), and are not encrypted (5.3.6).
+            (false, false) => return Ok(frame.to_vec()),
+            (false, true) => return Err(StandardSecurityError::Unencrypted),
+            (true, false) => return Err(StandardSecurityError::EncryptedAtLevelLow),
         }
 
         let (padding, rest) = self.read_fips_information(body)?;
@@ -529,6 +630,32 @@ impl StandardSecurity {
         push_fast_path_length(&mut out, length);
         out.extend_from_slice(&data);
         Ok(out)
+    }
+}
+
+/// The PDUs that the server may send encrypted at level Low: those whose security header is a Basic Security Header
+/// at level Low only where its flags do not contain `SEC_ENCRYPT`: the licensing PDUs ([MS-RDPBCGR] 2.2.1.12), the
+/// Auto-Detect Request PDU (2.2.14.3), the Initiate Multitransport Request PDU (2.2.15.1) and the Heartbeat PDU
+/// (2.2.16.1). Every other PDU of the server carries a Basic Security Header at level Low.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+const MAY_BE_ENCRYPTED_AT_LOW: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::LICENSE_PKT
+    .union(BasicSecurityHeaderFlags::AUTODETECT_REQ)
+    .union(BasicSecurityHeaderFlags::TRANSPORT_REQ)
+    .union(BasicSecurityHeaderFlags::HEARTBEAT);
+
+/// The user data as it is under Enhanced RDP Security: the data alone, or behind a Basic Security Header of the flags
+/// that say what the PDU is, where it has any.
+fn with_carried_flags(flags: BasicSecurityHeaderFlags, data: &[u8]) -> Vec<u8> {
+    let carried = flags.difference(ENCRYPTION_FLAGS);
+    if carried.is_empty() {
+        data.to_vec()
+    } else {
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&carried.bits().to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(data);
+        out
     }
 }
 
