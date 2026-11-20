@@ -2526,10 +2526,10 @@ impl ConfigBuilder {
         };
 
         let connector = ironrdp_connector::Config {
-            credentials: ironrdp_connector::Credentials::UsernamePassword {
+            credentials: Some(ironrdp_connector::Credentials::UsernamePassword {
                 username: self.username.unwrap_or_default(),
                 password: self.password.unwrap_or_default(),
-            },
+            }),
             domain: self.domain,
             enable_tls,
             enable_credssp,

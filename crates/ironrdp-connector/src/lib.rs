@@ -146,7 +146,7 @@ impl fmt::Debug for SmartCardIdentity {
 #[derive(Clone)]
 pub enum Credentials {
     UsernamePassword {
-        /// An empty username suppresses the X.224 `mstshash` cookie.
+        /// The user name. It is never written into the X.224 Connection Request: see [`Config::request_data`].
         username: String,
         /// INVARIANT: `Debug` output redacts this field.
         password: String,
@@ -295,7 +295,16 @@ pub struct Config {
     /// Defaults should stay `false`. Enable this only for known-local paths that opt in explicitly
     /// (e.g. `Transport::NamedPipe`).
     pub enable_standard_rdp_security: bool,
-    pub credentials: Credentials,
+    /// The credentials, or `None` until they are given with [`ClientConnector::provide_credentials`].
+    ///
+    /// Credentials set here are used from the start, as before. Leaving them `None` lets the caller establish the
+    /// server's identity first and only then give them, so that nothing of them exists in the connector before.
+    /// The connector never makes up credentials: CredSSP and the Client Info PDU fail with
+    /// [`ConnectorErrorKind::CredentialsNotProvided`] while this is `None`.
+    pub credentials: Option<Credentials>,
+    /// The domain of the credentials, if any.
+    ///
+    /// [`ClientConnector::provide_credentials`] sets it with the credentials.
     pub domain: Option<String>,
     /// The build number of the client.
     pub client_build: u32,
@@ -335,10 +344,9 @@ pub struct Config {
     pub hardware_id: Option<[u32; 4]>,
     /// Optional data for the x224 connection request.
     ///
-    /// Fallbacks to a sensible default depending on the provided credentials:
-    ///
-    /// - A cookie containing the username for a username/password.
-    /// - Nothing for a smart card.
+    /// This is the only cookie the connection request carries. None is made from the credentials, whatever
+    /// they are, so the user name is never sent before the server's identity is established. A client that
+    /// wants the `mstshash` cookie, for a connection broker for instance, sets it here.
     pub request_data: Option<NegoRequestData>,
     /// If true, the INFO_AUTOLOGON flag is set in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu)
     pub autologon: bool,
@@ -544,6 +552,34 @@ pub enum ConnectorErrorKind {
     General,
     Custom,
     Negotiation(NegotiationFailure),
+    /// CredSSP or the Client Info PDU was about to be made, and no credentials were given.
+    ///
+    /// See [`Config::credentials`] and [`ClientConnector::provide_credentials`].
+    CredentialsNotProvided,
+    /// [`ClientConnector::provide_credentials`] refused the credentials.
+    CredentialsRefused(CredentialsRefusal),
+}
+
+/// Why [`ClientConnector::provide_credentials`] refused the credentials.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialsRefusal {
+    /// The server's identity is not established yet: the connector has no completed TLS upgrade behind it.
+    IdentityNotEstablished,
+    /// Credentials were already given, in [`Config::credentials`] or by an earlier call.
+    AlreadyProvided,
+    /// The connector has made the Client Info PDU, has completed, or has failed: credentials are no longer used.
+    NoLongerAccepted,
+}
+
+impl fmt::Display for CredentialsRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentityNotEstablished => write!(f, "the server's identity is not established yet"),
+            Self::AlreadyProvided => write!(f, "credentials were already provided"),
+            Self::NoLongerAccepted => write!(f, "credentials are no longer accepted"),
+        }
+    }
 }
 
 impl fmt::Display for ConnectorErrorKind {
@@ -558,6 +594,8 @@ impl fmt::Display for ConnectorErrorKind {
             ConnectorErrorKind::General => write!(f, "general error"),
             ConnectorErrorKind::Custom => write!(f, "custom error"),
             ConnectorErrorKind::Negotiation(failure) => write!(f, "negotiation failure: {failure}"),
+            ConnectorErrorKind::CredentialsNotProvided => write!(f, "credentials not provided"),
+            ConnectorErrorKind::CredentialsRefused(refusal) => write!(f, "credentials refused: {refusal}"),
         }
     }
 }
@@ -574,6 +612,8 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::Custom => None,
             ConnectorErrorKind::General => None,
             ConnectorErrorKind::Negotiation(failure) => Some(failure),
+            ConnectorErrorKind::CredentialsNotProvided => None,
+            ConnectorErrorKind::CredentialsRefused(_) => None,
         }
     }
 }

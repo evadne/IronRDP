@@ -18,8 +18,8 @@ use ironrdp_async::{
 };
 use ironrdp_connector::credssp::{CredsspSequence, KerberosConfig};
 use ironrdp_connector::{
-    ClientConnector, ClientConnectorState, ConnectorError, ConnectorErrorExt as _, ConnectorResult, Credentials,
-    ServerName, State as _, custom_err, reason_err,
+    ClientConnector, ClientConnectorState, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult,
+    Credentials, ServerName, State as _, custom_err, reason_err,
 };
 use ironrdp_core::{WriteBuf, encode_vec};
 use ironrdp_pdu::nego::SecurityProtocol;
@@ -167,8 +167,13 @@ where
     debug!("Begin CredSSP (before X.224)");
 
     let mut buf = WriteBuf::new();
+    let credentials = connector
+        .config
+        .credentials
+        .clone()
+        .ok_or_else(|| ConnectorError::new("CredSSP", ConnectorErrorKind::CredentialsNotProvided))?;
     let (sequence, ts_request) = CredsspSequence::init(
-        connector.config.credentials.clone(),
+        credentials,
         connector.config.domain.as_deref(),
         PRE_X224_CREDSSP_PROTOCOL,
         server_name,
@@ -217,10 +222,10 @@ where
     // Host authentication is complete. Do not forward its identity or secret into the guest-facing
     // RDP sequence; Enhanced Session guest sign-in is a separate authentication seam. This happens
     // only after successful CredSSP, so a failed authentication leaves the connector reusable.
-    connector.config.credentials = Credentials::UsernamePassword {
+    connector.config.credentials = Some(Credentials::UsernamePassword {
         username: String::new(),
         password: String::new(),
-    };
+    });
     connector.config.domain = None;
     connector.config.autologon = false;
 

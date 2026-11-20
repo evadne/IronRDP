@@ -104,8 +104,14 @@ pub mod ffi {
             selected_protocol: ironrdp::pdu::nego::SecurityProtocol,
             kerbero_configs: Option<&KerberosConfig>,
         ) -> Result<Box<CredsspSequenceInitResult>, Box<IronRdpError>> {
+            let credentials = connector.config.credentials.clone().ok_or_else(|| {
+                ironrdp::connector::ConnectorError::new(
+                    "CredSSP",
+                    ironrdp::connector::ConnectorErrorKind::CredentialsNotProvided,
+                )
+            })?;
             let (credssp_sequence, ts_request) = ironrdp::connector::credssp::CredsspSequence::init(
-                connector.config.credentials.clone(),
+                credentials,
                 connector.config.domain.as_deref(),
                 selected_protocol,
                 server_name.into(),

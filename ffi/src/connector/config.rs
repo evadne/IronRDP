@@ -227,7 +227,7 @@ pub mod ffi {
 
         pub fn build(&self) -> Result<Box<Config>, Box<IronRdpError>> {
             let connector = ironrdp::connector::Config {
-                credentials: self.credentials.clone().ok_or("credentials not set")?,
+                credentials: Some(self.credentials.clone().ok_or("credentials not set")?),
                 domain: self.domain.clone(),
                 enable_tls: self.enable_tls.unwrap_or(false),
                 enable_credssp: self.enable_credssp.unwrap_or(true),

@@ -220,7 +220,7 @@ fn build_config(
     };
 
     Ok(connector::Config {
-        credentials: Credentials::UsernamePassword { username, password },
+        credentials: Some(Credentials::UsernamePassword { username, password }),
         domain,
         enable_tls: false, // This example does not expose any frontend.
         enable_credssp: true,

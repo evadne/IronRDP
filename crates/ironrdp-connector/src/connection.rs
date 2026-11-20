@@ -19,9 +19,22 @@ use crate::connection_activation::{
 };
 use crate::license_exchange::{LicenseExchangeSequence, NoopLicenseCache};
 use crate::{
-    Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, MonotonicInstant,
-    NegotiationFailure, Sequence, State, Written, encode_x224_packet, general_err, reason_err,
+    Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, Credentials,
+    CredentialsRefusal, DesktopSize, MonotonicInstant, NegotiationFailure, Sequence, State, Written,
+    encode_x224_packet, general_err, reason_err,
 };
+
+/// What the connector has behind it that establishes the server's identity, so that credentials may be given.
+///
+/// Only the caller can establish the identity: the connector records the step after which it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityBehind {
+    /// Nothing yet.
+    Nothing,
+    /// The caller completed the TLS upgrade ([`ClientConnector::mark_security_upgrade_as_done`] under an
+    /// enhanced security protocol), whose certificate it has judged.
+    TlsUpgrade,
+}
 
 /// Maximum number of `Initiate Multitransport Request` PDUs the server is
 /// permitted to send during bootstrapping, per MS-RDPBCGR 2.2.15.1 (one per
@@ -442,6 +455,8 @@ pub struct ClientConnector {
     /// Only accumulated while a window is open, since a total with no interval to
     /// divide it by is not a measurement of anything.
     connect_time_bw_bytes: u32,
+    /// What establishes the server's identity, for [`ClientConnector::provide_credentials`].
+    identity_behind: IdentityBehind,
     remote_guard: bool,
     remote_guard_ready: bool,
     // None disables NTLM; Some(None) binds it to the configured identity.
@@ -469,6 +484,7 @@ impl ClientConnector {
             redirection_password_cookie: None,
             connect_time_bw_started_at: None,
             connect_time_bw_bytes: 0,
+            identity_behind: IdentityBehind::Nothing,
             remote_guard: false,
             remote_guard_ready: false,
             #[cfg(feature = "remote-guard")]
@@ -774,13 +790,10 @@ impl ClientConnector {
             return Err(general_err!("RCG cannot negotiate without CredSSP"));
         }
         let connection_request = nego::ConnectionRequest {
+            // No cookie is made from the credentials: the user name must not cross the wire before the server's
+            // identity is established, which comes after this request.
             nego_data: if self.load_balance_info.is_none() {
-                self.config.request_data.clone().or_else(|| {
-                    self.config
-                        .credentials
-                        .username()
-                        .map(|username| nego::NegoRequestData::cookie(username.to_owned()))
-                })
+                self.config.request_data.clone()
             } else {
                 None
             },
@@ -919,6 +932,57 @@ impl ClientConnector {
         self.step(&[], None, &mut WriteBuf::new())
             .expect("transition to next state");
         debug_assert!(!self.should_perform_security_upgrade());
+    }
+
+    /// Give the credentials once the server's identity is established.
+    ///
+    /// They are accepted from the moment the connector has a completed TLS upgrade behind it
+    /// ([`Self::mark_security_upgrade_as_done`] under TLS, CredSSP or RDS AAD) until it makes the Client Info PDU,
+    /// and only when none were given before, in [`Config::credentials`] or by an earlier call. Under CredSSP they
+    /// must be given before the CredSSP sequence is made ([`crate::credssp::CredsspSequence::init_for_connector`]),
+    /// which reads them. Anything else is refused with [`ConnectorErrorKind::CredentialsRefused`], and changes
+    /// nothing.
+    ///
+    /// `domain` replaces [`Config::domain`].
+    pub fn provide_credentials(&mut self, credentials: Credentials, domain: Option<String>) -> ConnectorResult<()> {
+        let refused = |refusal| ConnectorError::new("Credentials", ConnectorErrorKind::CredentialsRefused(refusal));
+
+        if self.config.credentials.is_some() {
+            return Err(refused(CredentialsRefusal::AlreadyProvided));
+        }
+
+        match &self.state {
+            // Up to the Client Info PDU, the credentials are taken once the server's identity is established.
+            ClientConnectorState::ConnectionInitiationSendRequest
+            | ClientConnectorState::ConnectionInitiationWaitConfirm { .. }
+            | ClientConnectorState::EnhancedSecurityUpgrade { .. }
+            | ClientConnectorState::Credssp { .. }
+            | ClientConnectorState::EntraAuthWaitNonce
+            | ClientConnectorState::EntraAuthPending { .. }
+            | ClientConnectorState::EntraAuthWaitResult
+            | ClientConnectorState::BasicSettingsExchangeSendInitial { .. }
+            | ClientConnectorState::BasicSettingsExchangeWaitResponse { .. }
+            | ClientConnectorState::ChannelConnection { .. }
+            | ClientConnectorState::SecureSettingsExchange { .. } => match self.identity_behind {
+                IdentityBehind::Nothing => return Err(refused(CredentialsRefusal::IdentityNotEstablished)),
+                IdentityBehind::TlsUpgrade => {}
+            },
+            // The Client Info PDU is made, or the connector is done.
+            ClientConnectorState::ConnectTimeAutoDetection { .. }
+            | ClientConnectorState::LicensingExchange { .. }
+            | ClientConnectorState::MultitransportBootstrapping { .. }
+            | ClientConnectorState::MultitransportPending { .. }
+            | ClientConnectorState::CapabilitiesExchange { .. }
+            | ClientConnectorState::ConnectionFinalization { .. }
+            | ClientConnectorState::Connected { .. }
+            | ClientConnectorState::Redirected { .. }
+            | ClientConnectorState::Consumed => return Err(refused(CredentialsRefusal::NoLongerAccepted)),
+        }
+
+        self.config.credentials = Some(credentials);
+        self.config.domain = domain;
+
+        Ok(())
     }
 
     pub fn should_perform_credssp(&self) -> bool {
@@ -1469,6 +1533,10 @@ impl Sequence for ClientConnector {
             // still invoke mark_security_upgrade_as_done() (a no-op upgrade) before continuing.
             // When SSL/HYBRID is selected, user code must perform the TLS handshake first.
             ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => {
+                if !selected_protocol.is_standard_rdp_security() {
+                    self.identity_behind = IdentityBehind::TlsUpgrade;
+                }
+
                 let next_state = if selected_protocol.is_standard_rdp_security() {
                     debug!("Standard RDP security selected; skipping TLS and CredSSP");
                     ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol }
@@ -1659,8 +1727,22 @@ impl Sequence for ClientConnector {
             } => {
                 debug!("Secure Settings Exchange");
 
+                // Never an empty user name by default: the caller has to give the credentials first. The state is
+                // kept, so that it still can.
+                let Some(credentials) = &self.config.credentials else {
+                    self.state = ClientConnectorState::SecureSettingsExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    };
+                    return Err(ConnectorError::new(
+                        "Secure Settings Exchange",
+                        ConnectorErrorKind::CredentialsNotProvided,
+                    ));
+                };
+
                 let client_info = create_client_info_pdu(
                     &self.config,
+                    credentials,
                     &self.client_addr,
                     self.auto_reconnect_cookie.as_ref(),
                     self.redirection_password_cookie.as_deref(),
@@ -1741,7 +1823,12 @@ impl Sequence for ClientConnector {
                 } else {
                     let license_exchange = LicenseExchangeSequence::new(
                         io_channel_id,
-                        self.config.credentials.username().unwrap_or("").to_owned(),
+                        self.config
+                            .credentials
+                            .as_ref()
+                            .and_then(Credentials::username)
+                            .unwrap_or("")
+                            .to_owned(),
                         self.config.domain.clone(),
                         self.config.hardware_id.unwrap_or_default(),
                         self.config
@@ -2183,6 +2270,7 @@ fn monitor_extended_layout(config: &Config) -> Option<gcc::ClientMonitorExtended
 
 fn create_client_info_pdu(
     config: &Config,
+    credentials: &Credentials,
     client_addr: &SocketAddr,
     auto_reconnect_cookie: Option<&ServerAutoReconnect>,
     password_cookie: Option<&[u8]>,
@@ -2216,7 +2304,7 @@ fn create_client_info_pdu(
     }
 
     #[cfg(feature = "smart-card")]
-    if !entra_auth && !remote_guard && matches!(&config.credentials, crate::Credentials::SmartCard { .. }) {
+    if !entra_auth && !remote_guard && matches!(credentials, crate::Credentials::SmartCard { .. }) {
         flags |= ClientInfoFlags::PASSWORD_IS_SC_PIN;
     }
 
@@ -2250,11 +2338,11 @@ fn create_client_info_pdu(
 
     let client_info = ClientInfo {
         credentials: Credentials {
-            username: config.credentials.username().unwrap_or("").to_owned(),
+            username: credentials.username().unwrap_or("").to_owned(),
             password: if entra_auth || remote_guard {
                 String::new()
             } else {
-                config.credentials.secret().to_owned()
+                credentials.secret().to_owned()
             },
             domain: config.domain.clone(),
         },
@@ -2325,10 +2413,10 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
-            credentials: Credentials::UsernamePassword {
+            credentials: Some(Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
-            },
+            }),
             domain: None,
             client_build: 0,
             client_name: "test".into(),
@@ -2362,8 +2450,16 @@ mod tests {
             rdp_version: gcc::RdpVersion::V5_PLUS,
         };
 
-        let client_info =
-            create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None, false, false).client_info;
+        let client_info = create_client_info_pdu(
+            &config,
+            config.credentials.as_ref().unwrap(),
+            &"127.0.0.1:3389".parse().unwrap(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .client_info;
 
         assert!(client_info.flags.contains(ClientInfoFlags::RAIL));
         assert!(client_info.alternate_shell.is_empty());
@@ -2388,10 +2484,10 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
-            credentials: Credentials::UsernamePassword {
+            credentials: Some(Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
-            },
+            }),
             domain: None,
             client_build: 0,
             client_name: "test".into(),
@@ -2425,14 +2521,30 @@ mod tests {
             rdp_version: gcc::RdpVersion::V5_PLUS,
         };
 
-        let client_info =
-            create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None, false, false).client_info;
+        let client_info = create_client_info_pdu(
+            &config,
+            config.credentials.as_ref().unwrap(),
+            &"127.0.0.1:3389".parse().unwrap(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .client_info;
         assert!(client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
         assert!(!client_info.flags.contains(ClientInfoFlags::NO_AUDIO_PLAYBACK));
 
         config.enable_audio_capture = false;
-        let client_info =
-            create_client_info_pdu(&config, &"127.0.0.1:3389".parse().unwrap(), None, None, false, false).client_info;
+        let client_info = create_client_info_pdu(
+            &config,
+            config.credentials.as_ref().unwrap(),
+            &"127.0.0.1:3389".parse().unwrap(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .client_info;
         assert!(!client_info.flags.contains(ClientInfoFlags::AUDIO_CAPTURE));
     }
 
@@ -2453,10 +2565,10 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
-            credentials: Credentials::UsernamePassword {
+            credentials: Some(Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
-            },
+            }),
             domain: None,
             client_build: 0,
             client_name: "test".into(),
@@ -2543,10 +2655,10 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
-            credentials: Credentials::UsernamePassword {
+            credentials: Some(Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
-            },
+            }),
             domain: None,
             client_build: 0,
             client_name: "test".into(),

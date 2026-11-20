@@ -344,7 +344,7 @@ fn entra_rejects_invalid_authentication_results() {
 fn step_client_info(credentials: Credentials, entra: bool) -> ironrdp_pdu::rdp::client_info::ClientInfo {
     let mut config = super::test_config();
     config.autologon = true;
-    config.credentials = credentials;
+    config.credentials = Some(credentials);
     let mut connector = ClientConnector::new(config, "127.0.0.1:3389".parse().unwrap());
     if entra {
         connector = connector.with_entra_auth();

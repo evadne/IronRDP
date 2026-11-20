@@ -44,10 +44,10 @@ fn test_config() -> ironrdp_connector::Config {
         enable_tls: true,
         enable_credssp: false,
         enable_standard_rdp_security: false,
-        credentials: Credentials::UsernamePassword {
+        credentials: Some(Credentials::UsernamePassword {
             username: "test".into(),
             password: "test".into(),
-        },
+        }),
         domain: None,
         client_build: 0,
         client_name: "test".into(),

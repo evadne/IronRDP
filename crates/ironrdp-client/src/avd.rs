@@ -1013,7 +1013,7 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
     let site_id = challenge.site_id;
 
     let username_hint = match &config.connector.credentials {
-        Credentials::UsernamePassword { username, .. } if !username.is_empty() => Some(username.clone()),
+        Some(Credentials::UsernamePassword { username, .. }) if !username.is_empty() => Some(username.clone()),
         _ => (!gw.username.is_empty()).then(|| gw.username.clone()),
     };
 
@@ -1166,10 +1166,10 @@ async fn orchestrate_and_prepare(config: &Config, gw: &GatewayConfig) -> anyhow:
             .insert("uselogoncertificate", i64::from(logon_cert));
     }
     avd_config.connector.credentials = match &config.connector.credentials {
-        Credentials::UsernamePassword { password, .. } => Credentials::UsernamePassword {
+        Some(Credentials::UsernamePassword { password, .. }) => Some(Credentials::UsernamePassword {
             username: resolved_username.clone(),
             password: password.clone(),
-        },
+        }),
         other => other.clone(),
     };
 

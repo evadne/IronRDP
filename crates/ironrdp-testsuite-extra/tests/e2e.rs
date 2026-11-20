@@ -2466,10 +2466,10 @@ pub(super) fn default_client_config() -> connector::Config {
         enable_tls: true,
         enable_credssp: true,
         enable_standard_rdp_security: false,
-        credentials: connector::Credentials::UsernamePassword {
+        credentials: Some(connector::Credentials::UsernamePassword {
             username: USERNAME.into(),
             password: PASSWORD.into(),
-        },
+        }),
         domain: None,
         client_build: semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .map(|version| version.major * 100 + version.minor * 10 + version.patch)
@@ -2820,10 +2820,10 @@ async fn the_default_under_hybrid_lets_an_authenticated_newcomer_take_over() {
     let ev = server.event_sender().clone();
 
     let client_config = || connector::Config {
-        credentials: connector::Credentials::UsernamePassword {
+        credentials: Some(connector::Credentials::UsernamePassword {
             username: HYBRID_USER.into(),
             password: HYBRID_PASSWORD.into(),
-        },
+        }),
         ..default_client_config()
     };
 
@@ -2962,10 +2962,10 @@ fn hybrid_server() -> (RdpServer, UnboundedSender<DisplayUpdate>) {
 /// The client configuration that logs in to [`hybrid_server`].
 fn hybrid_client_config() -> connector::Config {
     connector::Config {
-        credentials: connector::Credentials::UsernamePassword {
+        credentials: Some(connector::Credentials::UsernamePassword {
             username: HYBRID_USER.into(),
             password: HYBRID_PASSWORD.into(),
-        },
+        }),
         ..default_client_config()
     }
 }

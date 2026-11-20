@@ -1542,7 +1542,7 @@ fn build_config(
     };
 
     connector::Config {
-        credentials: Credentials::UsernamePassword { username, password },
+        credentials: Some(Credentials::UsernamePassword { username, password }),
         domain,
         enable_tls: !security.enable_standard_rdp_security,
         enable_credssp: security.enable_credssp && !security.enable_standard_rdp_security,

@@ -2096,7 +2096,7 @@ fn client_cluster_data(config: &Config, enable_udp: bool) -> ironrdp_pdu::gcc::C
     }
     if matches!(
         config.connector.credentials,
-        ironrdp_connector::Credentials::SmartCard { .. }
+        Some(ironrdp_connector::Credentials::SmartCard { .. })
     ) {
         flags |= RedirectionFlags::REDIRECTED_SMARTCARD;
     }

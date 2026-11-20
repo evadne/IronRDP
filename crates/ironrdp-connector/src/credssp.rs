@@ -148,6 +148,9 @@ impl CredsspSequence {
     }
 
     /// Constructs the authentication exchange using the connector's negotiated security policy.
+    ///
+    /// Fails with [`ConnectorErrorKind::CredentialsNotProvided`] until the connector has credentials: see
+    /// [`crate::ClientConnector::provide_credentials`].
     pub fn init_for_connector(
         connector: &crate::ClientConnector,
         server_name: ServerName,
@@ -157,8 +160,14 @@ impl CredsspSequence {
         let crate::ClientConnectorState::Credssp { selected_protocol } = connector.state else {
             return Err(general_err!("invalid connector state for CredSSP sequence"));
         };
+        let Some(credentials) = connector.config.credentials.clone() else {
+            return Err(ConnectorError::new(
+                "CredSSP",
+                ConnectorErrorKind::CredentialsNotProvided,
+            ));
+        };
         let (mut sequence, initial_request) = Self::init_with_mode(
-            connector.config.credentials.clone(),
+            credentials,
             connector.config.domain.as_deref(),
             selected_protocol,
             server_name,

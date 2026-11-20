@@ -12001,7 +12001,7 @@ impl Control {
                 );
             }
         };
-        let Credentials::UsernamePassword { username, password } = &config.connector().credentials else {
+        let Some(Credentials::UsernamePassword { username, password }) = &config.connector().credentials else {
             return ironrdp_agent::ipc::Response::typed_error(
                 ironrdp_agent::ipc::AgentErrorCategory::InvalidRequest,
                 "smart card credentials are not supported by the ActiveX host",

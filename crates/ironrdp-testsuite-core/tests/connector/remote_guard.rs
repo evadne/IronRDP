@@ -27,10 +27,10 @@ fn connector() -> ClientConnector {
     let mut config = super::test_config();
     config.enable_credssp = true;
     config.autologon = true;
-    config.credentials = Credentials::UsernamePassword {
+    config.credentials = Some(Credentials::UsernamePassword {
         username: "test".into(),
         password: "secret-sentinel".into(),
-    };
+    });
     config.domain = Some("example.test".into());
     config.client_name = "test-client".into();
     ClientConnector::new(config, "127.0.0.1:3389".parse().unwrap())
@@ -319,7 +319,7 @@ fn rcg_client_info_never_copies_password_smartcard_pin_or_redirection_cookie() {
             .with_remote_guard(DrdynvcClient::new())
             .unwrap()
             .with_redirection_password_cookie(cookie.clone());
-        rcg.config.credentials = credentials;
+        rcg.config.credentials = Some(credentials);
         let (info, encoded) = step_client_info(rcg);
         assert!(info.client_info.credentials.password.is_empty());
         assert!(info.client_info.password_cookie.is_none());

@@ -148,8 +148,9 @@ pub(crate) fn apply_server_redirection(
 
     if let Some(username) = &redirection.username {
         match &mut config.connector.credentials {
-            Credentials::UsernamePassword { username: current, .. } => current.clone_from(username),
-            Credentials::SmartCard { .. } => debug!("Keeping the smart card identity across the redirection"),
+            Some(Credentials::UsernamePassword { username: current, .. }) => current.clone_from(username),
+            Some(Credentials::SmartCard { .. }) => debug!("Keeping the smart card identity across the redirection"),
+            None => debug!("No credentials to carry across the redirection"),
         }
     }
     if let Some(domain) = &redirection.domain {

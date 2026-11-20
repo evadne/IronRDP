@@ -191,10 +191,10 @@ pub mod ffi {
             let Some(connector) = self.0.as_mut() else {
                 return Err(ValueConsumedError::for_item("connector").into());
             };
-            connector.config.credentials = ironrdp::connector::Credentials::UsernamePassword {
+            connector.config.credentials = Some(ironrdp::connector::Credentials::UsernamePassword {
                 username: String::new(),
                 password: String::new(),
-            };
+            });
             connector.config.domain = None;
             connector.config.autologon = false;
             Ok(())
