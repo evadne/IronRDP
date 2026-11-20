@@ -328,6 +328,7 @@ fn active_stage_widens_after_a_reset_and_records_damage() {
         compression_type: None,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        standard_security: None,
     }
     .build();
 

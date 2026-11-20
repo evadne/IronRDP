@@ -3184,17 +3184,20 @@ dependencies = [
  "bit_field",
  "bitflags 2.13.2",
  "byteorder",
+ "cbc",
  "der-parser",
+ "des",
  "expect-test",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "ironrdp-core 0.3.1",
  "ironrdp-error 0.2.1",
- "md-5 0.10.6",
+ "md-5 0.11.0",
  "num-bigint",
  "num-derive 0.5.1",
  "num-integer",
  "num-traits",
  "pkcs1 0.7.5",
+ "rc4",
  "sha1 0.11.0",
  "tap",
  "x509-cert",
@@ -3618,6 +3621,7 @@ dependencies = [
  "ironrdp-svc",
  "ironrdp-tokio",
  "ironrdp-usb",
+ "num-bigint",
  "openh264",
  "paste",
  "png",
@@ -5665,6 +5669,15 @@ name = "rc2"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ceda21af1ae61033b63175653a1af86cae399d79cd03ca80ba347eb3a6c4a7fe"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
+name = "rc4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840038b674daa9f7a7957440d937951d15c0143c056e631e529141fd780e0c92"
 dependencies = [
  "cipher 0.5.2",
 ]

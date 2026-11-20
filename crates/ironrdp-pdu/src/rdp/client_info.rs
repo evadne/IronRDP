@@ -21,8 +21,9 @@ const RECONNECT_COOKIE_CB_LEN: u32 = 0x0000_001C;
 ///
 /// Enhanced RDP Security generates no client random ([MS-RDPBCGR] 5.3.2), and
 /// [MS-RDPBCGR] 5.5 specifies that in that case the client random is taken to be
-/// 32 zero bytes for this derivation. IronRDP implements no Standard RDP Security
-/// path (there is no Security Exchange PDU), so this is the only case that arises.
+/// 32 zero bytes for this derivation. Under Standard RDP Security the client random
+/// of the Security Exchange is used instead, through
+/// [`ClientAutoReconnect::from_server_cookie_and_client_random`].
 const ENHANCED_SECURITY_CLIENT_RANDOM: [u8; 32] = [0; 32];
 const TIMEZONE_INFO_NAME_LEN: usize = 64;
 const COMPRESSION_TYPE_MASK: u32 = 0x0000_1E00;
@@ -387,11 +388,27 @@ impl ClientAutoReconnect {
     /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e729948a-3f4e-4568-9aef-d355e30b5389
     /// [RFC 2104]: https://www.rfc-editor.org/rfc/rfc2104
     pub fn from_server_cookie(cookie: &crate::rdp::session_info::ServerAutoReconnect) -> Self {
+        Self::from_server_cookie_and_client_random(cookie, &ENHANCED_SECURITY_CLIENT_RANDOM)
+    }
+
+    /// Derive the response to a server-issued auto-reconnect cookie under Standard RDP Security.
+    ///
+    /// [MS-RDPBCGR] 5.5 computes the verifier over the client random, which under Standard RDP Security is the one
+    /// the client sent in the Security Exchange PDU ([MS-RDPBCGR] 2.2.1.10).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/e729948a-3f4e-4568-9aef-d355e30b5389
+    pub fn from_server_cookie_and_client_random(
+        cookie: &crate::rdp::session_info::ServerAutoReconnect,
+        client_random: &[u8; 32],
+    ) -> Self {
         use hmac::Mac as _;
+
+        let mut mac = Self::hmac(cookie);
+        mac.update(client_random);
 
         Self {
             logon_id: cookie.logon_id,
-            security_verifier: Self::keyed_hmac(cookie).finalize().into_bytes().into(),
+            security_verifier: mac.finalize().into_bytes().into(),
         }
     }
 
@@ -413,16 +430,17 @@ impl ClientAutoReconnect {
     pub fn verify(&self, cookie: &crate::rdp::session_info::ServerAutoReconnect) -> bool {
         use hmac::Mac as _;
 
-        self.logon_id == cookie.logon_id && Self::keyed_hmac(cookie).verify_slice(&self.security_verifier).is_ok()
+        let mut mac = Self::hmac(cookie);
+        mac.update(&ENHANCED_SECURITY_CLIENT_RANDOM);
+
+        self.logon_id == cookie.logon_id && mac.verify_slice(&self.security_verifier).is_ok()
     }
 
-    fn keyed_hmac(cookie: &crate::rdp::session_info::ServerAutoReconnect) -> hmac::Hmac<md5::Md5> {
-        use hmac::Mac as _;
+    fn hmac(cookie: &crate::rdp::session_info::ServerAutoReconnect) -> hmac::Hmac<md5::Md5> {
+        use hmac::KeyInit as _;
 
-        let mut mac = hmac::Hmac::<md5::Md5>::new_from_slice(&cookie.random_bits)
-            .expect("HMAC accepts a key of any length, so a 16-byte key cannot fail");
-        mac.update(&ENHANCED_SECURITY_CLIENT_RANDOM);
-        mac
+        hmac::Hmac::<md5::Md5>::new_from_slice(&cookie.random_bits)
+            .expect("HMAC accepts a key of any length, so a 16-byte key cannot fail")
     }
 
     /// The encoded packet, sized for the `autoReconnectCookie` field of the

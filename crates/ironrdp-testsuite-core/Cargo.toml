@@ -41,6 +41,7 @@ anyhow = "1"
 async-trait = "0.1"
 expect-test.workspace = true
 hex = "0.4"
+num-bigint = "0.4"
 ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
 ironrdp-cliprdr = { path = "../ironrdp-cliprdr", features = ["__test"] }
 ironrdp-acceptor.path = "../ironrdp-acceptor"

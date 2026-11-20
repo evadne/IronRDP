@@ -5,6 +5,7 @@ use ironrdp_pdu::rdp::capability_sets::{
     CapabilitySet, InputFlags, Rail, RailSupportLevel, WindowList, WindowSupportLevel,
 };
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+use ironrdp_pdu::rdp::standard_security::{IoChannelPdu, StandardSecurity};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -34,6 +35,8 @@ pub struct ConnectionActivationSequence {
     // here (rather than duplicated into every state variant).
     io_channel_id: u16,
     user_channel_id: u16,
+    /// The connection's security layer under Standard RDP Security, through which every PDU of the sequence goes.
+    standard_security: Option<StandardSecurity>,
 }
 
 impl ConnectionActivationSequence {
@@ -47,7 +50,13 @@ impl ConnectionActivationSequence {
             config,
             io_channel_id,
             user_channel_id,
+            standard_security: None,
         }
+    }
+
+    pub(crate) fn with_standard_security(mut self, standard_security: Option<StandardSecurity>) -> Self {
+        self.standard_security = standard_security;
+        self
     }
 
     pub fn io_channel_id(&self) -> u16 {
@@ -84,6 +93,7 @@ pub struct ConnectionActivationFactory {
     io_channel_id: u16,
     user_channel_id: u16,
     multitransport_soft_sync: bool,
+    standard_security: Option<StandardSecurity>,
 }
 
 impl ConnectionActivationFactory {
@@ -93,7 +103,13 @@ impl ConnectionActivationFactory {
             io_channel_id,
             user_channel_id,
             multitransport_soft_sync: false,
+            standard_security: None,
         }
+    }
+
+    pub(crate) fn with_standard_security(mut self, standard_security: Option<StandardSecurity>) -> Self {
+        self.standard_security = standard_security;
+        self
     }
 
     pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
@@ -117,6 +133,7 @@ impl ConnectionActivationFactory {
     #[must_use]
     pub fn create(&self) -> ConnectionActivationSequence {
         ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
+            .with_standard_security(self.standard_security.clone())
     }
 }
 
@@ -138,6 +155,34 @@ impl Sequence for ConnectionActivationSequence {
     }
 
     fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut ironrdp_core::WriteBuf,
+    ) -> ConnectorResult<Written> {
+        // Under Standard RDP Security every PDU of the activation goes through the connection's one security layer.
+        let Some(security) = self.standard_security.clone() else {
+            return self.step_plain(input, received_at, output);
+        };
+
+        let opened = if input.is_empty() {
+            Vec::new()
+        } else {
+            security.open(input).map_err(crate::standard_security_err)?
+        };
+        let mut plain = ironrdp_core::WriteBuf::new();
+        self.step_plain(&opened, received_at, &mut plain)?;
+        crate::write_sealed(&security, plain.filled(), IoChannelPdu::ShareControl, output)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "the step stays where it was, after the Sequence implementation that wraps it with the security layer"
+)]
+impl ConnectionActivationSequence {
+    /// One step of the sequence on a frame as it is under Enhanced RDP Security, writing what it sends so.
+    pub(crate) fn step_plain(
         &mut self,
         input: &[u8],
         received_at: Option<MonotonicInstant>,

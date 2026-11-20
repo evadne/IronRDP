@@ -30,6 +30,7 @@ fn active_stage() -> ActiveStage {
         compression_type: None,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        standard_security: None,
     }
     .build()
 }

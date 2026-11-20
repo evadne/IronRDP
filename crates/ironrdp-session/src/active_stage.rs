@@ -21,6 +21,7 @@ use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
 use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::{LogonErrorsInfo, ServerAutoReconnect};
+use ironrdp_pdu::rdp::standard_security::{IoChannelPdu, StandardSecurity, StandardSecurityError};
 use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
 use ironrdp_pdu::window::{
@@ -34,6 +35,13 @@ use tracing::{debug, warn};
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
 use crate::{SessionError, SessionErrorExt as _, SessionResult, fast_path, x224};
+
+fn standard_security_err(error: StandardSecurityError) -> SessionError {
+    SessionError::new(
+        "Standard RDP Security",
+        crate::SessionErrorKind::StandardSecurity(error),
+    )
+}
 
 fn to_bulk_compression_type(compression_type: CompressionType) -> BulkCompressionType {
     match compression_type {
@@ -53,6 +61,9 @@ pub struct ActiveStage {
     window_support_level: Option<WindowSupportLevel>,
     graphics_output_needs_full_refresh: bool,
     damage_regions: Vec<InclusiveRectangle>,
+    /// Under Standard RDP Security, the connection's one security layer: every frame received is opened by it, and
+    /// every frame sent sealed.
+    standard_security: Option<StandardSecurity>,
 }
 
 /// Builder for [`ActiveStage`].
@@ -71,6 +82,9 @@ pub struct ActiveStageBuilder {
     pub enable_server_pointer: bool,
     /// Use software rendering mode for pointer bitmap generation.
     pub pointer_software_rendering: bool,
+    /// Under Standard RDP Security, the connection's security layer, `ConnectionResult::standard_security`; `None`
+    /// under Enhanced RDP Security.
+    pub standard_security: Option<StandardSecurity>,
 }
 
 impl ActiveStageBuilder {
@@ -84,6 +98,7 @@ impl ActiveStageBuilder {
             compression_type,
             enable_server_pointer,
             pointer_software_rendering,
+            standard_security,
         } = self;
 
         let x224_processor = x224::Processor::new(
@@ -111,6 +126,7 @@ impl ActiveStageBuilder {
             window_support_level: None,
             graphics_output_needs_full_refresh: false,
             damage_regions: Vec::new(),
+            standard_security,
         }
     }
 }
@@ -120,6 +136,26 @@ fn new_bulk_decompressor(compression_type: Option<CompressionType>) -> Option<Bu
 }
 
 impl ActiveStage {
+    /// Seals frames to be sent under Standard RDP Security; under Enhanced RDP Security they are sent as they are.
+    fn seal(&self, frames: Vec<u8>) -> SessionResult<Vec<u8>> {
+        match &self.standard_security {
+            Some(security) if !frames.is_empty() => security
+                .seal(&frames, IoChannelPdu::ShareControl)
+                .map_err(standard_security_err),
+            _ => Ok(frames),
+        }
+    }
+
+    fn seal_outputs(&self, outputs: Vec<ActiveStageOutput>) -> SessionResult<Vec<ActiveStageOutput>> {
+        outputs
+            .into_iter()
+            .map(|output| match output {
+                ActiveStageOutput::ResponseFrame(frame) => Ok(ActiveStageOutput::ResponseFrame(self.seal(frame)?)),
+                other => Ok(other),
+            })
+            .collect()
+    }
+
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
     }
@@ -156,7 +192,7 @@ impl ActiveStage {
             // PERF: unnecessary copy
             let fastpath_input = FastPathInput::new(event_chunk.to_vec()).map_err(SessionError::decode)?;
             let frame = ironrdp_core::encode_vec(&fastpath_input).map_err(SessionError::encode)?;
-            output.push(ActiveStageOutput::ResponseFrame(frame));
+            output.push(ActiveStageOutput::ResponseFrame(self.seal(frame)?));
         }
 
         // If pointer rendering is disabled - we can skip the rest
@@ -203,11 +239,30 @@ impl ActiveStage {
         received_at: Option<MonotonicInstant>,
     ) -> SessionResult<Vec<ActiveStageOutput>> {
         self.damage_regions.clear();
+        let opened;
+        let frame = match &self.standard_security {
+            Some(security) => {
+                opened = security.open(frame).map_err(standard_security_err)?;
+                opened.as_slice()
+            }
+            None => frame,
+        };
+        let stage_outputs = self.process_opened(image, action, frame, received_at)?;
+        self.seal_outputs(stage_outputs)
+    }
+
+    fn process_opened(
+        &mut self,
+        image: &mut DecodedImage,
+        action: Action,
+        frame: &[u8],
+        received_at: Option<MonotonicInstant>,
+    ) -> SessionResult<Vec<ActiveStageOutput>> {
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
-                // Fast-path frames carry no security flags or data signature: IronRDP supports
-                // Enhanced RDP Security, and Standard RDP Security only at ENCRYPTION_LEVEL_NONE.
-                // The continuous bandwidth count therefore includes the entire frame.
+                // Fast-path frames carry no security flags or data signature here: under Standard RDP Security
+                // the frame was opened by the security layer. The continuous bandwidth count therefore includes
+                // the entire frame as opened.
                 self.x224_processor.record_bandwidth_bytes(frame.len());
                 let mut output = WriteBuf::new();
                 let processor_updates =
@@ -445,7 +500,7 @@ impl ActiveStage {
         self.x224_processor
             .encode_static(&mut frame, ShareDataPdu::ShutdownRequest)?;
 
-        Ok(vec![ActiveStageOutput::ResponseFrame(frame.into_inner())])
+        Ok(vec![ActiveStageOutput::ResponseFrame(self.seal(frame.into_inner())?)])
     }
 
     /// Requests a full redraw of the negotiated desktop.
@@ -500,11 +555,11 @@ impl ActiveStage {
                 }),
             )?;
 
-            return Ok(vec![suppress.into_inner(), resume.into_inner()]);
+            return Ok(vec![self.seal(suppress.into_inner())?, self.seal(resume.into_inner())?]);
         }
 
         if refresh_rect_support {
-            return Ok(vec![self.request_full_refresh(width, height)?]);
+            return Ok(vec![self.seal(self.request_full_refresh(width, height)?)?]);
         }
 
         Ok(Vec::new())
@@ -512,12 +567,19 @@ impl ActiveStage {
 
     /// Send a pdu on the static global channel. Typically used to send input events
     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
-        self.x224_processor.encode_static(output, pdu)
+        if self.standard_security.is_none() {
+            return self.x224_processor.encode_static(output, pdu);
+        }
+        let mut plain = WriteBuf::new();
+        self.x224_processor.encode_static(&mut plain, pdu)?;
+        let sealed = self.seal(plain.into_inner())?;
+        output.write_slice(&sealed);
+        Ok(sealed.len())
     }
 
     /// Encodes an Initiate Multitransport Response on the negotiated MCS message channel.
     pub fn encode_multitransport_response(&self, response: &MultitransportResponsePdu) -> SessionResult<Vec<u8>> {
-        self.x224_processor.encode_multitransport_response(response)
+        self.seal(self.x224_processor.encode_multitransport_response(response)?)
     }
 
     pub fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&T> {
@@ -562,7 +624,7 @@ impl ActiveStage {
         &self,
         messages: SvcProcessorMessages<C>,
     ) -> SessionResult<Vec<u8>> {
-        self.x224_processor.process_svc_processor_messages(messages)
+        self.seal(self.x224_processor.process_svc_processor_messages(messages)?)
     }
 
     /// Completes an SVC request for a runtime-defined channel name.
@@ -571,7 +633,10 @@ impl ActiveStage {
         channel_name: &ChannelName,
         messages: Vec<SvcMessage>,
     ) -> SessionResult<Vec<u8>> {
-        self.x224_processor.process_svc_messages_by_name(channel_name, messages)
+        self.seal(
+            self.x224_processor
+                .process_svc_messages_by_name(channel_name, messages)?,
+        )
     }
 
     /// Marks the reliable UDP tunnel as available for DRDYNVC Soft-Sync.
@@ -1293,6 +1358,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            standard_security: None,
         }
         .build();
 
@@ -1315,6 +1381,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            standard_security: None,
         }
         .build();
         let response = MultitransportResponsePdu::success(42);
@@ -1341,6 +1408,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            standard_security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1386,6 +1454,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: true,
             pointer_software_rendering: true,
+            standard_security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
@@ -1834,6 +1903,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            standard_security: None,
         }
         .build()
     }

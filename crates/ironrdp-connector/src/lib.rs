@@ -42,6 +42,9 @@ pub use self::connection_finalization::{ConnectionFinalizationSequence, Connecti
 pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
 pub use self::server_name::ServerName;
 pub use crate::license_exchange::LicenseCache;
+pub use ironrdp_pdu::rdp::standard_security::{
+    IoChannelPdu, ServerKeyError, ServerPublicKey, StandardSecurity, StandardSecurityError,
+};
 
 /// Provides user-friendly error messages for RDP negotiation failures
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,6 +581,61 @@ pub enum ConnectorErrorKind {
     CredentialsNotProvided,
     /// [`ClientConnector::provide_credentials`] refused the credentials.
     CredentialsRefused(CredentialsRefusal),
+    /// The server's Server Security Data selects what the connector does not take under Standard RDP Security
+    /// ([`ClientConnector::with_standard_rdp_security_encryption`]).
+    StandardSecurityRefused(StandardSecurityRefusal),
+    /// The key of the server's certificate under Standard RDP Security cannot encrypt the client random.
+    ServerKey(ServerKeyError),
+    /// A PDU under Standard RDP Security could not be sealed or opened: a MAC that does not verify, a PDU that is not
+    /// encrypted, lengths that do not hold together.
+    StandardSecurity(StandardSecurityError),
+}
+
+/// Why the connector refuses the server's selection of encryption under Standard RDP Security.
+///
+/// Levels None and Low are each a configuration that [MS-RDPBCGR] allows a server and that the connector does not
+/// share with it: under either, what the server sends would cross the network unencrypted. The other two are the
+/// server's breach of [MS-RDPBCGR] 2.2.1.3.3 and 5.3.2.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardSecurityRefusal {
+    /// `ENCRYPTION_LEVEL_NONE` with `ENCRYPTION_METHOD_NONE`: nothing is encrypted.
+    LevelNone,
+    /// `ENCRYPTION_LEVEL_LOW`: only what the client sends is encrypted.
+    LevelLow,
+    /// A method that is not exactly one of those the client advertised.
+    MethodNotAdvertised { method: gcc::EncryptionMethod },
+    /// A level and a method that [MS-RDPBCGR] 5.3.2 does not allow together: one of them none and the other not, or
+    /// one of them FIPS and the other not.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    LevelMethodMismatch {
+        level: gcc::EncryptionLevel,
+        method: gcc::EncryptionMethod,
+    },
+}
+
+impl fmt::Display for StandardSecurityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LevelNone => write!(f, "the server selected encryption level None"),
+            Self::LevelLow => write!(f, "the server selected encryption level Low"),
+            Self::MethodNotAdvertised { method } => {
+                write!(
+                    f,
+                    "the server selected encryption method {method:?}, which was not advertised"
+                )
+            }
+            Self::LevelMethodMismatch { level, method } => {
+                write!(
+                    f,
+                    "the server selected encryption level {level:?} with method {method:?}"
+                )
+            }
+        }
+    }
 }
 
 /// Why [`ClientConnector::provide_credentials`] refused the credentials.
@@ -626,6 +684,11 @@ impl fmt::Display for ConnectorErrorKind {
             }
             ConnectorErrorKind::CredentialsNotProvided => write!(f, "credentials not provided"),
             ConnectorErrorKind::CredentialsRefused(refusal) => write!(f, "credentials refused: {refusal}"),
+            ConnectorErrorKind::StandardSecurityRefused(refusal) => {
+                write!(f, "standard RDP security refused: {refusal}")
+            }
+            ConnectorErrorKind::ServerKey(error) => write!(f, "server key: {error}"),
+            ConnectorErrorKind::StandardSecurity(error) => write!(f, "standard RDP security: {error}"),
         }
     }
 }
@@ -646,6 +709,9 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::ServerErrorInfo(_) => None,
             ConnectorErrorKind::CredentialsNotProvided => None,
             ConnectorErrorKind::CredentialsRefused(_) => None,
+            ConnectorErrorKind::StandardSecurityRefused(_) => None,
+            ConnectorErrorKind::ServerKey(e) => Some(e),
+            ConnectorErrorKind::StandardSecurity(e) => Some(e),
         }
     }
 }
@@ -715,6 +781,25 @@ impl<T> ConnectorResultExt for ConnectorResult<T> {
     {
         self.map_err(|e| e.with_source(source))
     }
+}
+
+pub(crate) fn standard_security_err(error: StandardSecurityError) -> ConnectorError {
+    ConnectorError::new("Standard RDP Security", ConnectorErrorKind::StandardSecurity(error))
+}
+
+/// Seals what a step wrote as it would be under Enhanced RDP Security into `output`.
+pub(crate) fn write_sealed(
+    security: &StandardSecurity,
+    plain: &[u8],
+    io_channel_pdu: IoChannelPdu,
+    output: &mut WriteBuf,
+) -> ConnectorResult<Written> {
+    if plain.is_empty() {
+        return Ok(Written::Nothing);
+    }
+    let sealed = security.seal(plain, io_channel_pdu).map_err(standard_security_err)?;
+    output.write_slice(&sealed);
+    Written::from_size(sealed.len())
 }
 
 pub fn encode_x224_packet<T>(x224_msg: &T, buf: &mut WriteBuf) -> ConnectorResult<usize>

@@ -297,6 +297,7 @@ fn session_chunks_omit_show_protocol_without_the_channel_option() {
         compression_type: None,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        standard_security: None,
     }
     .build();
 
@@ -332,6 +333,7 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
         compression_type: None,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        standard_security: None,
     }
     .build();
     assert!(active_stage.reactivate(1003, 1002, 2, false, false, 4096));

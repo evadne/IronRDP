@@ -230,6 +230,7 @@ impl ReplayRouter {
             compression_type: activation.compression_type,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            standard_security: None,
         }
         .build();
         Ok(Self {

@@ -11,6 +11,7 @@ mod entra;
 mod reasons;
 #[cfg(feature = "remote-guard")]
 mod remote_guard;
+mod standard_security;
 
 fn test_config() -> ironrdp_connector::Config {
     ironrdp_connector::Config {

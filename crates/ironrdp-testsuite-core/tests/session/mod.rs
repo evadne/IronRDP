@@ -6,6 +6,7 @@ mod fast_path;
 mod heartbeat;
 pub(crate) mod rfx;
 mod save_session_info;
+mod standard_security;
 
 #[cfg(test)]
 mod tests {

@@ -6,8 +6,13 @@ use std::sync::Arc;
 
 use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
+use ironrdp_pdu::rdp::security_exchange::SecurityExchangePdu;
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+use ironrdp_pdu::rdp::standard_security::{
+    CLIENT_RANDOM_SIZE, IoChannelPdu, Role, SERVER_RANDOM_SIZE, ServerPublicKey, StandardSecurity,
+    StandardSecurityMethod,
+};
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
@@ -34,6 +39,49 @@ enum IdentityBehind {
     /// The caller completed the TLS upgrade ([`ClientConnector::mark_security_upgrade_as_done`] under an
     /// enhanced security protocol), whose certificate it has judged.
     TlsUpgrade,
+    /// The caller answered the server's key under Standard RDP Security
+    /// ([`ClientConnector::accept_standard_security_key`]), which it has judged.
+    StandardSecurityKey,
+}
+
+/// Why the server's Server Security Data cannot be taken under Standard RDP Security, or the method it selected.
+///
+/// The levels that the connector does not share are found before the method: a server at level None or Low is refused
+/// as configured so whatever it selected with it, xrdp at level Low selecting a 40-bit method that was not advertised.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+fn standard_security_method(
+    security: &gcc::ServerSecurityData,
+) -> Result<StandardSecurityMethod, crate::StandardSecurityRefusal> {
+    use crate::StandardSecurityRefusal;
+    use gcc::{EncryptionLevel, EncryptionMethod};
+
+    let level = security.encryption_level;
+    let method = security.encryption_method;
+    let mismatch = || StandardSecurityRefusal::LevelMethodMismatch { level, method };
+
+    // [MS-RDPBCGR] 5.3.2: the level is zero exactly where the method is.
+    match (level == EncryptionLevel::None, method.is_empty()) {
+        (true, true) => return Err(StandardSecurityRefusal::LevelNone),
+        (true, false) | (false, true) => return Err(mismatch()),
+        (false, false) => {}
+    }
+
+    if level == EncryptionLevel::Low {
+        return Err(StandardSecurityRefusal::LevelLow);
+    }
+
+    // [MS-RDPBCGR] 2.2.1.3.3: the server MUST select one of the methods the client advertised.
+    let selected =
+        StandardSecurityMethod::from_selected(method).ok_or(StandardSecurityRefusal::MethodNotAdvertised { method })?;
+
+    // [MS-RDPBCGR] 5.3.2: at level FIPS the method is FIPS; and the table of 5.3.6 has the FIPS method at no other
+    // level.
+    if (level == EncryptionLevel::Fips) != (method == EncryptionMethod::FIPS) {
+        return Err(mismatch());
+    }
+
+    Ok(selected)
 }
 
 /// Maximum number of `Initiate Multitransport Request` PDUs the server is
@@ -200,6 +248,9 @@ pub struct ConnectionResult {
     pub activation_factory: ConnectionActivationFactory,
     /// The bulk compression type that was negotiated, if any.
     pub compression_type: Option<rdp::client_info::CompressionType>,
+    /// Under Standard RDP Security, the connection's one security layer, through which every PDU of the session goes:
+    /// give it to the session. The activation sequences of [`Self::activation_factory`] hold it already.
+    pub standard_security: Option<StandardSecurity>,
 }
 
 impl ConnectionResult {
@@ -271,9 +322,32 @@ pub enum ClientConnectorState {
     BasicSettingsExchangeWaitResponse {
         connect_initial: mcs::ConnectInitial,
     },
+    /// Standard RDP Security: the Server Security Data is read, and the connector holds the server's key for the
+    /// caller, who judges it.
+    ///
+    /// Nothing of the Security Exchange exists yet, and nothing is sent until the caller answers with
+    /// [`ClientConnector::accept_standard_security_key`], giving the client random; read the key with
+    /// [`ClientConnector::standard_security_key`].
+    StandardSecurityKey {
+        io_channel_id: u16,
+        channel_connection: ChannelConnectionSequence,
+        server_key: Box<ServerPublicKey>,
+        server_random: [u8; SERVER_RANDOM_SIZE],
+        method: StandardSecurityMethod,
+    },
     ChannelConnection {
         io_channel_id: u16,
         channel_connection: ChannelConnectionSequence,
+        /// Under Standard RDP Security, the Security Exchange PDU to send once every channel is joined.
+        security_exchange: Option<SecurityExchangePdu>,
+    },
+    /// Standard RDP Security: the Security Exchange PDU is sent ([MS-RDPBCGR] 1.3.1.1, RDP Security Commencement).
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    SecurityCommencement {
+        io_channel_id: u16,
+        user_channel_id: u16,
+        security_exchange: SecurityExchangePdu,
     },
     SecureSettingsExchange {
         io_channel_id: u16,
@@ -387,7 +461,9 @@ impl State for ClientConnectorState {
             Self::EntraAuthWaitResult => "EntraAuthWaitResult",
             Self::BasicSettingsExchangeSendInitial { .. } => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse { .. } => "BasicSettingsExchangeWaitResponse",
+            Self::StandardSecurityKey { .. } => "StandardSecurityKey",
             Self::ChannelConnection { .. } => "ChannelConnection",
+            Self::SecurityCommencement { .. } => "SecurityCommencement",
             Self::SecureSettingsExchange { .. } => "SecureSettingsExchange",
             Self::ConnectTimeAutoDetection { .. } => "ConnectTimeAutoDetection",
             Self::LicensingExchange { .. } => "LicensingExchange",
@@ -457,6 +533,11 @@ pub struct ClientConnector {
     connect_time_bw_bytes: u32,
     /// What establishes the server's identity, for [`ClientConnector::provide_credentials`].
     identity_behind: IdentityBehind,
+    /// Whether Standard RDP Security is taken with its encryption: see
+    /// [`ClientConnector::with_standard_rdp_security_encryption`].
+    standard_security_encryption: bool,
+    /// The connection's security layer under Standard RDP Security, from the caller's answer to the server's key.
+    standard_security: Option<StandardSecurity>,
     remote_guard: bool,
     remote_guard_ready: bool,
     // None disables NTLM; Some(None) binds it to the configured identity.
@@ -485,6 +566,8 @@ impl ClientConnector {
             connect_time_bw_started_at: None,
             connect_time_bw_bytes: 0,
             identity_behind: IdentityBehind::Nothing,
+            standard_security_encryption: false,
+            standard_security: None,
             remote_guard: false,
             remote_guard_ready: false,
             #[cfg(feature = "remote-guard")]
@@ -492,6 +575,86 @@ impl ClientConnector {
             #[cfg(feature = "remote-guard")]
             remote_guard_kerberos: false,
         }
+    }
+
+    /// Take Standard RDP Security only with its encryption ([MS-RDPBCGR] 5.3), where it is selected.
+    ///
+    /// The Client Security Data advertises 128-bit RC4 and FIPS, and the server's selection is held to them: levels
+    /// None and Low, a method not advertised, and a level and a method that do not go together each end the connection
+    /// with [`ConnectorErrorKind::StandardSecurityRefused`]. Having read the Server Security Data, the connector
+    /// stops in [`ClientConnectorState::StandardSecurityKey`] with the server's key, before anything of the Security
+    /// Exchange exists; the caller judges the key and answers with
+    /// [`Self::accept_standard_security_key`], giving the client random, from which point the credentials may be
+    /// given ([`Self::provide_credentials`]). Every PDU after the Security Exchange is then encrypted and signed by
+    /// the connection's security layer, [`ConnectionResult::standard_security`], which the session takes.
+    ///
+    /// Without this, Standard RDP Security is taken only at level None, as before.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    #[must_use]
+    pub fn with_standard_rdp_security_encryption(mut self) -> Self {
+        self.standard_security_encryption = true;
+        self
+    }
+
+    /// The server's key under Standard RDP Security, while the connector waits for the caller's answer to it.
+    pub fn standard_security_key(&self) -> Option<&ServerPublicKey> {
+        match &self.state {
+            ClientConnectorState::StandardSecurityKey { server_key, .. } => Some(server_key),
+            _ => None,
+        }
+    }
+
+    /// Whether the connector waits for the caller's answer to the server's key under Standard RDP Security.
+    pub fn should_answer_standard_security_key(&self) -> bool {
+        matches!(self.state, ClientConnectorState::StandardSecurityKey { .. })
+    }
+
+    /// Answers the server's key under Standard RDP Security: the caller has judged it and goes on.
+    ///
+    /// `client_random` is the 32 bytes of the client random ([MS-RDPBCGR] 5.3.4), which the caller draws from a
+    /// cryptographically safe generator: the connector draws no randomness for it. The session keys are derived from
+    /// it and the server random, and the Security Exchange PDU is made, to be sent once the channels are joined.
+    /// Refused, changing nothing, in any other state.
+    ///
+    /// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+    pub fn accept_standard_security_key(&mut self, client_random: [u8; CLIENT_RANDOM_SIZE]) -> ConnectorResult<()> {
+        let (io_channel_id, channel_connection, server_key, server_random, method) = match mem::take(&mut self.state) {
+            ClientConnectorState::StandardSecurityKey {
+                io_channel_id,
+                channel_connection,
+                server_key,
+                server_random,
+                method,
+            } => (io_channel_id, channel_connection, server_key, server_random, method),
+            other => {
+                self.state = other;
+                return Err(reason_err!(
+                    "StandardSecurityKey",
+                    "no server key is awaiting an answer"
+                ));
+            }
+        };
+
+        let security_exchange = SecurityExchangePdu {
+            encrypted_client_random: server_key.encrypt_client_random(&client_random),
+        };
+        self.standard_security = Some(StandardSecurity::new(
+            Role::Client,
+            method,
+            &client_random,
+            &server_random,
+            io_channel_id,
+            self.message_channel_id,
+        ));
+        self.identity_behind = IdentityBehind::StandardSecurityKey;
+        self.state = ClientConnectorState::ChannelConnection {
+            io_channel_id,
+            channel_connection,
+            security_exchange: Some(security_exchange),
+        };
+
+        Ok(())
     }
 
     /// Require RDS AAD Auth instead of TLS-only logon or CredSSP.
@@ -764,8 +927,8 @@ impl ClientConnector {
             security_protocol.insert(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX);
         }
 
-        // PROTOCOL_RDP (empty flags) is standard RDP security. IronRDP only supports the
-        // ENCRYPTION_LEVEL_NONE variant (no RC4 Security Exchange). Keep it opt-in so
+        // PROTOCOL_RDP (empty flags) is standard RDP security, at ENCRYPTION_LEVEL_NONE unless
+        // the caller asks for its encryption (`with_standard_rdp_security_encryption`). Keep it opt-in so
         // `enable_tls = false` + `enable_credssp = false` cannot silently open a plaintext
         // TCP session; local named-pipe transports set `enable_standard_rdp_security`.
         if security_protocol.is_standard_rdp_security() {
@@ -962,10 +1125,12 @@ impl ClientConnector {
             | ClientConnectorState::EntraAuthWaitResult
             | ClientConnectorState::BasicSettingsExchangeSendInitial { .. }
             | ClientConnectorState::BasicSettingsExchangeWaitResponse { .. }
+            | ClientConnectorState::StandardSecurityKey { .. }
             | ClientConnectorState::ChannelConnection { .. }
+            | ClientConnectorState::SecurityCommencement { .. }
             | ClientConnectorState::SecureSettingsExchange { .. } => match self.identity_behind {
                 IdentityBehind::Nothing => return Err(refused(CredentialsRefusal::IdentityNotEstablished)),
-                IdentityBehind::TlsUpgrade => {}
+                IdentityBehind::TlsUpgrade | IdentityBehind::StandardSecurityKey => {}
             },
             // The Client Info PDU is made, or the connector is done.
             ClientConnectorState::ConnectTimeAutoDetection { .. }
@@ -1193,7 +1358,16 @@ impl ClientConnector {
                 .response_pdu(request_id, soft_sync)
                 .ok_or_else(|| general_err!("multitransport response channel selected without a required response"))?;
 
-            encode_send_data_request(user_channel_id, response_channel, &response, output)?
+            match &self.standard_security {
+                Some(security) => {
+                    let mut plain = WriteBuf::new();
+                    encode_send_data_request(user_channel_id, response_channel, &response, &mut plain)?;
+                    crate::write_sealed(security, plain.filled(), IoChannelPdu::ShareControl, output)?
+                        .size()
+                        .unwrap_or(0)
+                }
+                None => encode_send_data_request(user_channel_id, response_channel, &response, output)?,
+            }
         } else {
             0
         };
@@ -1421,7 +1595,9 @@ impl Sequence for ClientConnector {
                 Some(&crate::entra::ENTRA_POST_AUTH_X224_HINT)
             }
             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
+            ClientConnectorState::StandardSecurityKey { .. } => None,
             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
+            ClientConnectorState::SecurityCommencement { .. } => None,
             ClientConnectorState::SecureSettingsExchange { .. } => None,
             ClientConnectorState::ConnectTimeAutoDetection { .. } => {
                 // Wait for input only when a message channel was negotiated, so
@@ -1455,6 +1631,41 @@ impl Sequence for ClientConnector {
     }
 
     fn step(
+        &mut self,
+        input: &[u8],
+        received_at: Option<MonotonicInstant>,
+        output: &mut WriteBuf,
+    ) -> ConnectorResult<Written> {
+        // Under Standard RDP Security, what the server sends during the connect-time auto-detection and the
+        // licensing is opened by the security layer, and what the client sends is sealed by it, licensing PDUs being
+        // sent as they are. The other states after the Security Exchange seal and open in their own arms: the Client
+        // Info, the multitransport bootstrapping, and the activation sequence, which holds the layer.
+        if let Some(security) = self.standard_security.clone()
+            && matches!(
+                self.state,
+                ClientConnectorState::ConnectTimeAutoDetection { .. } | ClientConnectorState::LicensingExchange { .. }
+            )
+        {
+            let opened = if input.is_empty() {
+                Vec::new()
+            } else {
+                security.open(input).map_err(crate::standard_security_err)?
+            };
+            let mut plain = WriteBuf::new();
+            self.step_unsealed(&opened, received_at, &mut plain)?;
+            return crate::write_sealed(&security, plain.filled(), IoChannelPdu::Licensing, output);
+        }
+
+        self.step_unsealed(input, received_at, output)
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "the step stays where it was, after the Sequence implementation that wraps it with the security layer"
+)]
+impl ClientConnector {
+    fn step_unsealed(
         &mut self,
         input: &[u8],
         received_at: Option<MonotonicInstant>,
@@ -1603,6 +1814,7 @@ impl Sequence for ClientConnector {
                     selected_protocol,
                     self.response_flags
                         .contains(nego::ResponseFlags::EXTENDED_CLIENT_DATA_SUPPORTED),
+                    self.standard_security_encryption && selected_protocol.is_standard_rdp_security(),
                     self.static_channels.values(),
                 )?;
 
@@ -1636,11 +1848,38 @@ impl Sequence for ClientConnector {
 
                 let server_gcc_blocks = connect_response.conference_create_response.into_gcc_blocks();
 
-                if client_gcc_blocks.security == gcc::ClientSecurityData::no_security()
+                let standard_security_encryption =
+                    client_gcc_blocks.security.encryption_methods == StandardSecurityMethod::ADVERTISED;
+
+                if !standard_security_encryption
+                    && client_gcc_blocks.security == gcc::ClientSecurityData::no_security()
                     && server_gcc_blocks.security != gcc::ServerSecurityData::no_security()
                 {
                     return Err(general_err!("can't satisfy server security settings"));
                 }
+
+                // Under Standard RDP Security with its encryption, the selection is judged on the Server Security
+                // Data, before the key is read, so that nothing of the server's identity is asked for a connection
+                // that will not be made.
+                let standard_security = if standard_security_encryption {
+                    let method = standard_security_method(&server_gcc_blocks.security).map_err(|refusal| {
+                        ConnectorError::new(
+                            "Basic Settings Exchange",
+                            ConnectorErrorKind::StandardSecurityRefused(refusal),
+                        )
+                    })?;
+                    let server_random = server_gcc_blocks
+                        .security
+                        .server_random
+                        .ok_or_else(|| general_err!("the Server Security Data carries no server random"))?;
+                    let server_key = ServerPublicKey::from_server_certificate(&server_gcc_blocks.security.server_cert)
+                        .map_err(|error| {
+                            ConnectorError::new("Basic Settings Exchange", ConnectorErrorKind::ServerKey(error))
+                        })?;
+                    Some((method, server_random, server_key))
+                } else {
+                    None
+                };
 
                 self.message_channel_id = server_gcc_blocks
                     .message_channel
@@ -1673,19 +1912,41 @@ impl Sequence for ClientConnector {
                     .early_capability_flags
                     .is_some_and(|c| c.contains(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED));
 
+                let channel_connection = if skip_channel_join {
+                    ChannelConnectionSequence::skip_channel_join()
+                } else {
+                    let mut join_channel_ids = static_channel_ids;
+                    join_channel_ids.extend(self.message_channel_id);
+                    ChannelConnectionSequence::new(io_channel_id, join_channel_ids)
+                };
+
                 (
                     Written::Nothing,
-                    ClientConnectorState::ChannelConnection {
-                        io_channel_id,
-                        channel_connection: if skip_channel_join {
-                            ChannelConnectionSequence::skip_channel_join()
-                        } else {
-                            let mut join_channel_ids = static_channel_ids;
-                            join_channel_ids.extend(self.message_channel_id);
-                            ChannelConnectionSequence::new(io_channel_id, join_channel_ids)
+                    match standard_security {
+                        Some((method, server_random, server_key)) => ClientConnectorState::StandardSecurityKey {
+                            io_channel_id,
+                            channel_connection,
+                            server_key: Box::new(server_key),
+                            server_random,
+                            method,
+                        },
+                        None => ClientConnectorState::ChannelConnection {
+                            io_channel_id,
+                            channel_connection,
+                            security_exchange: None,
                         },
                     },
                 )
+            }
+
+            //== Standard RDP Security: the server's key ==//
+            // The caller judges the key and answers with accept_standard_security_key().
+            state @ ClientConnectorState::StandardSecurityKey { .. } => {
+                self.state = state;
+                return Err(reason_err!(
+                    "StandardSecurityKey",
+                    "the server's key awaits the caller's answer"
+                ));
             }
 
             //== Channel Connection ==//
@@ -1693,6 +1954,7 @@ impl Sequence for ClientConnector {
             ClientConnectorState::ChannelConnection {
                 io_channel_id,
                 mut channel_connection,
+                security_exchange,
             } => {
                 debug!("Channel Connection");
                 let written = channel_connection.step(input, received_at, output)?;
@@ -1701,14 +1963,22 @@ impl Sequence for ClientConnector {
                 {
                     debug_assert!(channel_connection.state.is_terminal());
 
-                    ClientConnectorState::SecureSettingsExchange {
-                        io_channel_id,
-                        user_channel_id,
+                    match security_exchange {
+                        Some(security_exchange) => ClientConnectorState::SecurityCommencement {
+                            io_channel_id,
+                            user_channel_id,
+                            security_exchange,
+                        },
+                        None => ClientConnectorState::SecureSettingsExchange {
+                            io_channel_id,
+                            user_channel_id,
+                        },
                     }
                 } else {
                     ClientConnectorState::ChannelConnection {
                         io_channel_id,
                         channel_connection,
+                        security_exchange,
                     }
                 };
 
@@ -1716,11 +1986,24 @@ impl Sequence for ClientConnector {
             }
 
             //== RDP Security Commencement ==//
-            // With standard RDP security and ENCRYPTION_LEVEL_NONE, no Security Exchange PDU is
-            // sent (MS-RDPBCGR 5.3.2). IronRDP only supports that no-encryption path; RC4/FIPS
-            // would require a Security Exchange here and is rejected earlier when the server's
-            // SC_SECURITY block is not ServerSecurityData::no_security().
-            //==============================//
+            // Under Standard RDP Security with its encryption, the client random goes to the server, encrypted with
+            // its key ([MS-RDPBCGR] 2.2.1.10). With ENCRYPTION_LEVEL_NONE no Security Exchange PDU is sent
+            // ([MS-RDPBCGR] 5.3.2), and the connector goes from the channels straight to the Client Info.
+            ClientConnectorState::SecurityCommencement {
+                io_channel_id,
+                user_channel_id,
+                security_exchange,
+            } => {
+                debug!("RDP Security Commencement");
+                let written = encode_send_data_request(user_channel_id, io_channel_id, &security_exchange, output)?;
+                (
+                    Written::from_size(written)?,
+                    ClientConnectorState::SecureSettingsExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    },
+                )
+            }
 
             //== Secure Settings Exchange ==//
             // Send Client Info PDU (information about supported types of compression, username, password, etc).
@@ -1743,11 +2026,21 @@ impl Sequence for ClientConnector {
                     ));
                 };
 
+                let auto_reconnect = match (&self.auto_reconnect_cookie, &self.standard_security) {
+                    (Some(cookie), Some(security)) => Some(
+                        security
+                            .client_auto_reconnect(cookie)
+                            .map_err(crate::standard_security_err)?,
+                    ),
+                    (Some(cookie), None) => Some(rdp::client_info::ClientAutoReconnect::from_server_cookie(cookie)),
+                    (None, _) => None,
+                };
+
                 let client_info = create_client_info_pdu(
                     &self.config,
                     credentials,
                     &self.client_addr,
-                    self.auto_reconnect_cookie.as_ref(),
+                    auto_reconnect.as_ref(),
                     self.redirection_password_cookie.as_deref(),
                     self.entra_auth,
                     self.remote_guard,
@@ -1755,10 +2048,24 @@ impl Sequence for ClientConnector {
 
                 debug!(message = ?client_info, "Send");
 
-                let written = encode_send_data_request(user_channel_id, io_channel_id, &client_info, output)?;
+                // Under Standard RDP Security the Client Info PDU is the first that is encrypted ([MS-RDPBCGR]
+                // 2.2.1.11).
+                let written = match &self.standard_security {
+                    Some(security) => {
+                        let mut plain = WriteBuf::new();
+                        encode_send_data_request(user_channel_id, io_channel_id, &client_info, &mut plain)?;
+                        crate::write_sealed(security, plain.filled(), IoChannelPdu::ClientInfo, output)?
+                    }
+                    None => Written::from_size(encode_send_data_request(
+                        user_channel_id,
+                        io_channel_id,
+                        &client_info,
+                        output,
+                    )?)?,
+                };
 
                 (
-                    Written::from_size(written)?,
+                    written,
                     ClientConnectorState::ConnectTimeAutoDetection {
                         io_channel_id,
                         user_channel_id,
@@ -1913,6 +2220,11 @@ impl Sequence for ClientConnector {
                 let ctx = mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
                 if Some(ctx.channel_id) == message_channel_id {
+                    let opened = match &self.standard_security {
+                        Some(security) => security.open(input).map_err(crate::standard_security_err)?,
+                        None => input.to_vec(),
+                    };
+                    let ctx = mcs::decode_send_data_indication(&opened).map_err(ConnectorError::decode)?;
                     let pdu = decode::<rdp::multitransport::MultitransportRequestPdu>(ctx.user_data)
                         .map_err(ConnectorError::decode)?;
 
@@ -1951,8 +2263,10 @@ impl Sequence for ClientConnector {
                 } else if ctx.channel_id == io_channel_id {
                     // Demand Active: bootstrapping is over, hand off to capabilities
                     // exchange with the PDU intact.
+                    // The activation sequence holds the security layer, and opens the Demand Active itself.
                     let mut connection_activation =
-                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id);
+                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id)
+                            .with_standard_security(self.standard_security.clone());
                     let written = connection_activation.step(input, received_at, output)?;
 
                     (
@@ -2065,8 +2379,10 @@ impl Sequence for ClientConnector {
                                         connection_activation.io_channel_id(),
                                         connection_activation.user_channel_id(),
                                     )
-                                    .with_multitransport_soft_sync(self.soft_sync_negotiated()),
+                                    .with_multitransport_soft_sync(self.soft_sync_negotiated())
+                                    .with_standard_security(self.standard_security.clone()),
                                     compression_type: self.config.compression_type,
+                                    standard_security: self.standard_security.clone(),
                                 },
                             }
                         }
@@ -2114,6 +2430,7 @@ fn create_gcc_blocks<'a>(
     cluster_data: Option<&gcc::ClientClusterData>,
     selected_protocol: nego::SecurityProtocol,
     extended_client_data_supported: bool,
+    standard_security_encryption: bool,
     static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
@@ -2225,7 +2542,12 @@ fn create_gcc_blocks<'a>(
             },
         },
         security: ClientSecurityData {
-            encryption_methods: EncryptionMethod::empty(),
+            // R3: 128-bit RC4 and FIPS under Standard RDP Security with its encryption; nothing otherwise.
+            encryption_methods: if standard_security_encryption {
+                StandardSecurityMethod::ADVERTISED
+            } else {
+                EncryptionMethod::empty()
+            },
             ext_encryption_methods: 0,
         },
         network: if channels.is_empty() {
@@ -2275,15 +2597,15 @@ fn create_client_info_pdu(
     config: &Config,
     credentials: &Credentials,
     client_addr: &SocketAddr,
-    auto_reconnect_cookie: Option<&ServerAutoReconnect>,
+    auto_reconnect: Option<&rdp::client_info::ClientAutoReconnect>,
     password_cookie: Option<&[u8]>,
     entra_auth: bool,
     remote_guard: bool,
 ) -> rdp::ClientInfoPdu {
     use ironrdp_pdu::rdp::ClientInfoPdu;
     use ironrdp_pdu::rdp::client_info::{
-        AddressFamily, ClientAutoReconnect, ClientInfo, ClientInfoFlags, CompressionType, Credentials,
-        ExtendedClientInfo, ExtendedClientOptionalInfo, PasswordCookie,
+        AddressFamily, ClientInfo, ClientInfoFlags, CompressionType, Credentials, ExtendedClientInfo,
+        ExtendedClientOptionalInfo, PasswordCookie,
     };
     use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 
@@ -2374,10 +2696,8 @@ fn create_client_info_pdu(
                 // Resuming a session: prove we held the cookie the server issued
                 // for it ([MS-RDPBCGR] 2.2.4.3, derived per 5.5). Absent on a
                 // fresh connection, which is an ordinary logon.
-                match auto_reconnect_cookie {
-                    Some(cookie) => builder
-                        .reconnect_cookie(ClientAutoReconnect::from_server_cookie(cookie).to_bytes())
-                        .build(),
+                match auto_reconnect {
+                    Some(packet) => builder.reconnect_cookie(packet.to_bytes()).build(),
                     None => builder.build(),
                 }
             },
@@ -2615,6 +2935,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC blocks");
@@ -2627,6 +2948,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC blocks");
@@ -2700,6 +3022,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC Client Monitor Data");
@@ -2730,6 +3053,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC Client Monitor Extended Data");
@@ -2746,6 +3070,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC Client Monitor Data");
@@ -2758,6 +3083,7 @@ mod tests {
             None,
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC Client Monitor Data");
@@ -2777,6 +3103,7 @@ mod tests {
             &config,
             None,
             nego::SecurityProtocol::empty(),
+            false,
             false,
             core::iter::empty(),
         )
@@ -2804,6 +3131,7 @@ mod tests {
             Some(&cluster_data),
             nego::SecurityProtocol::empty(),
             true,
+            false,
             core::iter::empty(),
         )
         .expect("valid GCC Client Cluster Data");

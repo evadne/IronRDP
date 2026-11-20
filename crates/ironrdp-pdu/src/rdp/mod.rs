@@ -14,10 +14,12 @@ pub mod heartbeat;
 pub mod message_channel;
 pub mod multitransport;
 pub mod refresh_rectangle;
+pub mod security_exchange;
 pub mod server_error_info;
 pub mod server_license;
 pub mod server_redirection;
 pub mod session_info;
+pub mod standard_security;
 pub mod suppress_output;
 pub mod vc;
 

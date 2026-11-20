@@ -38,6 +38,9 @@ pub enum SessionErrorKind {
     Decode(ironrdp_core::DecodeError),
     FastPathBulkDecompression(FastPathBulkDecompressionFailure),
     InvalidBitmapSourceLength,
+    /// A PDU under Standard RDP Security could not be sealed or opened: a MAC that does not verify, a PDU that is not
+    /// encrypted, lengths that do not hold together.
+    StandardSecurity(ironrdp_pdu::rdp::standard_security::StandardSecurityError),
     Reason(String),
     General,
     Custom,
@@ -51,6 +54,7 @@ impl fmt::Display for SessionErrorKind {
             SessionErrorKind::Decode(_) => write!(f, "decode error"),
             SessionErrorKind::FastPathBulkDecompression(_) => write!(f, "fast-path bulk decompression error"),
             SessionErrorKind::InvalidBitmapSourceLength => write!(f, "invalid bitmap source length"),
+            SessionErrorKind::StandardSecurity(error) => write!(f, "standard RDP security: {error}"),
             SessionErrorKind::Reason(description) => write!(f, "reason: {description}"),
             SessionErrorKind::General => write!(f, "general error"),
             SessionErrorKind::Custom => write!(f, "custom error"),
@@ -66,6 +70,7 @@ impl core::error::Error for SessionErrorKind {
             SessionErrorKind::Decode(e) => Some(e),
             SessionErrorKind::FastPathBulkDecompression(_) => None,
             SessionErrorKind::InvalidBitmapSourceLength => None,
+            SessionErrorKind::StandardSecurity(e) => Some(e),
             SessionErrorKind::Reason(_) => None,
             SessionErrorKind::General => None,
             SessionErrorKind::Custom => None,
