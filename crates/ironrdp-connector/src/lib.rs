@@ -36,7 +36,7 @@ pub use sspi;
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 pub use self::connection::{
     ClientConnector, ClientConnectorState, ConnectionOutcome, ConnectionResult, DynamicStaticChannelAttachError,
-    MultitransportResult, encode_send_data_request,
+    MAX_SERVER_CERTIFICATE_LEN, MultitransportResult, encode_send_data_request,
 };
 pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
 pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
@@ -585,6 +585,12 @@ pub enum ConnectorErrorKind {
     /// The server's Server Security Data selects what the connector does not take under Standard RDP Security
     /// ([`ClientConnector::with_standard_rdp_security_encryption`]).
     StandardSecurityRefused(StandardSecurityRefusal),
+    /// The certificate of the server's Server Security Data under Standard RDP Security is longer than the connector
+    /// takes, [`MAX_SERVER_CERTIFICATE_LEN`] bytes; its key is not read.
+    ServerCertificateTooLong {
+        /// The certificate's length in bytes.
+        length: usize,
+    },
     /// The key of the server's certificate under Standard RDP Security cannot encrypt the client random.
     ServerKey(ServerKeyError),
     /// A PDU under Standard RDP Security could not be sealed or opened: a MAC that does not verify, a PDU that is not
@@ -685,6 +691,10 @@ impl fmt::Display for ConnectorErrorKind {
             ConnectorErrorKind::StandardSecurityRefused(refusal) => {
                 write!(f, "standard RDP security refused: {refusal}")
             }
+            ConnectorErrorKind::ServerCertificateTooLong { length } => write!(
+                f,
+                "the server certificate is {length} bytes, over {MAX_SERVER_CERTIFICATE_LEN} bytes"
+            ),
             ConnectorErrorKind::ServerKey(error) => write!(f, "server key: {error}"),
             ConnectorErrorKind::StandardSecurity(error) => write!(f, "standard RDP security: {error}"),
         }
@@ -708,6 +718,7 @@ impl core::error::Error for ConnectorErrorKind {
             ConnectorErrorKind::CredentialsNotProvided => None,
             ConnectorErrorKind::CredentialsRefused(_) => None,
             ConnectorErrorKind::StandardSecurityRefused(_) => None,
+            ConnectorErrorKind::ServerCertificateTooLong { .. } => None,
             ConnectorErrorKind::ServerKey(e) => Some(e),
             ConnectorErrorKind::StandardSecurity(e) => Some(e),
         }

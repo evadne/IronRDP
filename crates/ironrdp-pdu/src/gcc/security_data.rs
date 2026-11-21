@@ -14,7 +14,6 @@ const SERVER_ENCRYPTION_LEVEL_SIZE: usize = 4;
 const SERVER_RANDOM_LEN_SIZE: usize = 4;
 const SERVER_CERT_LEN_SIZE: usize = 4;
 const SERVER_RANDOM_LEN: usize = 0x20;
-const MAX_SERVER_CERT_LEN: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -175,11 +174,10 @@ impl<'de> Decode<'de> for ServerSecurityData {
                 return Err(invalid_field_err!("serverRandomLen", "Invalid server random length", in: src));
             }
 
+            // The certificate is taken at any length that the PDU holds, which bounds it: nothing is allocated by the
+            // declared length before its bytes are there. How long a certificate a client takes is the client's to
+            // judge, as a value of its own, and not a failure to decode.
             let server_cert_len = cast_length!("serverCertLen", src.read_u32(), in: src)?;
-
-            if server_cert_len > MAX_SERVER_CERT_LEN {
-                return Err(invalid_field_err!("serverCetLen", "Invalid server certificate length", in: src));
-            }
 
             ensure_size!(in: src, size: SERVER_RANDOM_LEN);
             let server_random = src.read_array();

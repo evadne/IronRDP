@@ -689,9 +689,11 @@ fn server_key_with_padding_that_is_not_zero_is_refused() {
     ));
 }
 
-/// B-SERVERCERT, upstream's: the Server Security Data's certificate of 1,024 bytes is read, of 1,025 refused.
+/// The Server Security Data's certificate is read at any length that the PDU holds, 1,025 bytes among them: its
+/// bound is the connector's, a value of its own (`ironrdp_connector::MAX_SERVER_CERTIFICATE_LEN`), and not a failure
+/// to decode. A certificate longer than the PDU holds is refused before anything is read by its length.
 #[test]
-fn server_certificate_length_is_held_to_1024_bytes() {
+fn server_certificate_is_read_at_any_length_that_the_pdu_holds() {
     let security_data = |certificate_length: usize| {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&EncryptionMethod::BIT_128.bits().to_le_bytes());
@@ -703,7 +705,17 @@ fn server_certificate_length_is_held_to_1024_bytes() {
         decode::<crate::gcc::ServerSecurityData>(&bytes)
     };
     assert_eq!(security_data(1024).unwrap().server_cert.len(), 1024);
-    assert!(security_data(1025).is_err());
+    assert_eq!(security_data(1025).unwrap().server_cert.len(), 1025);
+    assert_eq!(security_data(16_384).unwrap().server_cert.len(), 16_384);
+
+    let mut short = Vec::new();
+    short.extend_from_slice(&EncryptionMethod::BIT_128.bits().to_le_bytes());
+    short.extend_from_slice(&3u32.to_le_bytes()); // High
+    short.extend_from_slice(&32u32.to_le_bytes());
+    short.extend_from_slice(&1025u32.to_le_bytes());
+    short.extend_from_slice(&SERVER_RANDOM);
+    short.extend_from_slice(&[0; 1024]);
+    assert!(decode::<crate::gcc::ServerSecurityData>(&short).is_err());
 }
 
 /// The Security Exchange PDU's encrypted client random is held to the buffer of the largest key taken.

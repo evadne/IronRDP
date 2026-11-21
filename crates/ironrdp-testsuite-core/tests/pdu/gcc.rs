@@ -965,6 +965,34 @@ fn from_buffer_server_security_data_fails_with_invalid_server_random_length() {
     };
 }
 
+/// The certificate is taken at any length that the PDU holds: how long a certificate a client takes is the client's
+/// to judge, and not a failure to decode.
+// oracle: spec MS-RDPBCGR §2.2.1.4.3
+#[test]
+fn server_security_data_takes_a_certificate_of_any_length_that_the_pdu_holds() {
+    let mut security_data = SERVER_SECURITY_DATA_WITH_OPTIONAL_FIELDS.clone();
+    security_data.server_cert = vec![0xC5; 4096];
+    let buffer = encode_vec(&security_data).unwrap();
+
+    assert_eq!(security_data, decode(buffer.as_slice()).unwrap());
+}
+
+/// A certificate whose declared length is past the end of the PDU fails as too few bytes, so that nothing is
+/// allocated by the declared length.
+// oracle: spec MS-RDPBCGR §2.2.1.4.3
+#[test]
+fn server_security_data_fails_where_the_certificate_is_longer_than_the_pdu() {
+    let mut security_data = SERVER_SECURITY_DATA_WITH_OPTIONAL_FIELDS.clone();
+    security_data.server_cert = vec![0xC5; 4096];
+    let mut buffer = encode_vec(&security_data).unwrap();
+    buffer.truncate(buffer.len() - 1);
+
+    match decode::<ServerSecurityData>(buffer.as_slice()) {
+        Err(e) if matches!(e.kind(), DecodeErrorKind::NotEnoughBytes { .. }) => (),
+        res => panic!("Expected too few bytes for the certificate, got: {res:?}"),
+    };
+}
+
 #[test]
 fn to_buffer_correctly_serializes_server_security_data_without_optional_fields() {
     let security_data = SERVER_SECURITY_DATA_WITHOUT_OPTIONAL_FIELDS.clone();

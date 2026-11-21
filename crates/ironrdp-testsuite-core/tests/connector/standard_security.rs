@@ -8,8 +8,8 @@
 use std::borrow::Cow;
 
 use ironrdp_connector::{
-    ClientConnector, ClientConnectorState, ConnectorErrorKind, Credentials, CredentialsRefusal, Sequence as _,
-    StandardSecurityRefusal,
+    ClientConnector, ClientConnectorState, ConnectorErrorKind, Credentials, CredentialsRefusal,
+    MAX_SERVER_CERTIFICATE_LEN, Sequence as _, StandardSecurityRefusal,
 };
 use ironrdp_core::{WriteBuf, decode, encode_vec};
 use ironrdp_pdu::gcc::{
@@ -378,6 +378,64 @@ fn a_server_key_past_its_bounds_is_refused_before_it_is_held() {
         .unwrap_err();
     assert!(matches!(error.kind(), ConnectorErrorKind::ServerKey(_)), "{error:?}");
     assert!(connector.standard_security_key().is_none());
+}
+
+/// A Proprietary Certificate of the sample key whose encoding is exactly `length` bytes, its signature lengthened to
+/// make it so: the signature is not checked.
+fn certificate_of_length(length: usize) -> Vec<u8> {
+    let signature_len = 72 + (length - certificate().len());
+    let mut modulus = MODULUS.to_vec();
+    modulus.extend_from_slice(&[0; 8]);
+    let certificate = encode_vec(&ServerCertificate {
+        issued_permanently: true,
+        certificate: CertificateType::Proprietary(ProprietaryCertificate {
+            public_key: RsaPublicKey {
+                public_exponent: 0x0001_0001,
+                modulus,
+            },
+            signature: vec![0; signature_len],
+        }),
+    })
+    .unwrap();
+    assert_eq!(certificate.len(), length);
+    certificate
+}
+
+/// The certificate's bound through the connector: one of `MAX_SERVER_CERTIFICATE_LEN` bytes is taken and its key
+/// held, and one byte longer ends the connection with its length as a value, before its key is read.
+// oracle: spec MS-RDPBCGR §2.2.1.4.3
+#[test]
+fn a_certificate_past_its_bound_is_refused_with_its_length_before_its_key_is_read() {
+    let mut at_the_bound = connector(true);
+    to_basic_settings(&mut at_the_bound);
+    let mut security = security_data(EncryptionMethod::BIT_128, EncryptionLevel::High);
+    security.server_cert = certificate_of_length(MAX_SERVER_CERTIFICATE_LEN);
+    let mut output = WriteBuf::new();
+    at_the_bound
+        .step(&connect_response(security), None, &mut output)
+        .unwrap();
+    assert_eq!(
+        at_the_bound.standard_security_key().map(|key| key.modulus_bits()),
+        Some(512)
+    );
+
+    let mut past_it = connector(true);
+    to_basic_settings(&mut past_it);
+    let mut security = security_data(EncryptionMethod::BIT_128, EncryptionLevel::High);
+    security.server_cert = certificate_of_length(MAX_SERVER_CERTIFICATE_LEN + 1);
+    let mut output = WriteBuf::new();
+    let error = past_it
+        .step(&connect_response(security), None, &mut output)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.kind(),
+            ConnectorErrorKind::ServerCertificateTooLong { length } if *length == MAX_SERVER_CERTIFICATE_LEN + 1
+        ),
+        "{error:?}"
+    );
+    assert_eq!(output.filled_len(), 0, "nothing is sent on a refusal");
+    assert!(past_it.standard_security_key().is_none());
 }
 
 // == R4: the server's key, before anything of the Security Exchange == //

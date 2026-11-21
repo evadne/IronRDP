@@ -92,6 +92,13 @@ fn standard_security_selection(
     })
 }
 
+/// The longest certificate of the Server Security Data that the connector takes under Standard RDP Security, in
+/// bytes ([MS-RDPBCGR] 2.2.1.4.3): a longer one ends the connection with
+/// [`ConnectorErrorKind::ServerCertificateTooLong`], before its key is read.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+pub const MAX_SERVER_CERTIFICATE_LEN: usize = 1024;
+
 /// Maximum number of `Initiate Multitransport Request` PDUs the server is
 /// permitted to send during bootstrapping, per MS-RDPBCGR 2.2.15.1 (one per
 /// transport protocol: reliable + lossy UDP).
@@ -590,7 +597,8 @@ impl ClientConnector {
     /// The Client Security Data advertises the 40-bit, 56-bit and 128-bit RC4 methods and FIPS, and the server's
     /// selection is held to them: level None, a method not advertised, and a level and a method that do not go
     /// together each end the connection
-    /// with [`ConnectorErrorKind::StandardSecurityRefused`]. Having read the Server Security Data, the connector
+    /// with [`ConnectorErrorKind::StandardSecurityRefused`], and a certificate longer than
+    /// [`MAX_SERVER_CERTIFICATE_LEN`] with [`ConnectorErrorKind::ServerCertificateTooLong`]. Having read the Server Security Data, the connector
     /// stops in [`ClientConnectorState::StandardSecurityKey`] with the server's key, before anything of the Security
     /// Exchange exists; the caller judges the key and answers with
     /// [`Self::accept_standard_security_key`], giving the client random, from which point the credentials may be
@@ -1899,6 +1907,15 @@ impl ClientConnector {
                         .security
                         .server_random
                         .ok_or_else(|| general_err!("the Server Security Data carries no server random"))?;
+                    let server_cert_len = server_gcc_blocks.security.server_cert.len();
+                    if MAX_SERVER_CERTIFICATE_LEN < server_cert_len {
+                        return Err(ConnectorError::new(
+                            "Basic Settings Exchange",
+                            ConnectorErrorKind::ServerCertificateTooLong {
+                                length: server_cert_len,
+                            },
+                        ));
+                    }
                     let server_key = ServerPublicKey::from_server_certificate(&server_gcc_blocks.security.server_cert)
                         .map_err(|error| {
                             ConnectorError::new("Basic Settings Exchange", ConnectorErrorKind::ServerKey(error))
